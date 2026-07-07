@@ -1,2 +1,2 @@
 # Dashboard-Intern-Company
-MSC Dashboard  COO
+MSC Dashboard
