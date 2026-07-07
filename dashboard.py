@@ -123,6 +123,39 @@ def init_db():
     conn.close()
 
 
+def clean_price_to_float(value):
+    if value is None:
+        return None
+
+    s = str(value).strip()
+    if s in ("", "nan", "None", "NaN"):
+        return None
+
+    s = (
+        s.replace("€", "")
+         .replace("$", "")
+         .replace("£", "")
+         .replace("¥", "")
+         .replace("EUR", "")
+         .replace(" ", "")
+    )
+
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "")
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(".", "")
+        s = s.replace(",", ".")
+
+    try:
+        return float(s)
+    except:
+        return None
+
+
 # ================= EMAILS =================
 def get_all_emails():
     conn = get_conn()
@@ -440,7 +473,6 @@ def get_stock_overall_count():
     return row["cnt"] if row else 0
 
 
-# ================= HELPERS =================
 def open_file(path):
     try:
         if not path:
@@ -832,7 +864,7 @@ def open_members():
 def open_meetings():
     win = tk.Toplevel(root)
     win.title("Meetings")
-    win.geometry("900x600")
+    win.geometry("950x620")
     win.configure(bg="#f5f5f5")
 
     left = tk.Frame(win, bg="#f5f5f5", width=260)
@@ -858,13 +890,35 @@ def open_meetings():
 
     tk.Label(right, text="Meetings", font=("Arial", 14, "bold"), bg="#ffffff").pack(anchor="w", padx=10, pady=(10, 8))
 
-    top_filter = tk.Frame(right, bg="#ffffff")
-    top_filter.pack(fill="x", padx=10, pady=(0, 8))
+    filter_frame = tk.Frame(right, bg="#ffffff")
+    filter_frame.pack(fill="x", padx=10, pady=(0, 8))
 
-    tk.Label(top_filter, text="View date:", bg="#ffffff", font=("Arial", 10)).pack(side="left")
-    filter_entry = tk.Entry(top_filter, width=18, font=("Arial", 11))
+    view_mode = tk.StringVar(value="all")
+
+    tk.Radiobutton(
+        filter_frame,
+        text="Show All",
+        variable=view_mode,
+        value="all",
+        bg="#ffffff",
+        command=lambda: apply_filter()
+    ).pack(side="left", padx=(0, 10))
+
+    tk.Radiobutton(
+        filter_frame,
+        text="Search by Date",
+        variable=view_mode,
+        value="date",
+        bg="#ffffff",
+        command=lambda: apply_filter()
+    ).pack(side="left", padx=(0, 10))
+
+    tk.Label(filter_frame, text="Date:", bg="#ffffff", font=("Arial", 10)).pack(side="left")
+    filter_entry = tk.Entry(filter_frame, width=16, font=("Arial", 11))
     filter_entry.pack(side="left", padx=(6, 8))
     filter_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+
+    tk.Button(filter_frame, text="Apply", bg="#2196F3", fg="white", width=10, command=lambda: apply_filter()).pack(side="left")
 
     selected_date_label = tk.Label(right, text="", font=("Arial", 11, "bold"), bg="#ffffff", fg="#1565c0")
     selected_date_label.pack(anchor="w", padx=10, pady=(0, 5))
@@ -883,37 +937,78 @@ def open_meetings():
     canvas.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
 
-    def refresh_meetings_for_date(selected_date):
+    def render_meetings(meetings, label_text):
         for widget in meetings_container.winfo_children():
             widget.destroy()
 
-        try:
-            datetime.strptime(selected_date, "%Y-%m-%d")
-        except ValueError:
-            selected_date_label.config(text="Λάθος μορφή ημερομηνίας. Βάλε YYYY-MM-DD")
-            return
-
-        selected_date_label.config(text=f"Selected date: {selected_date}")
-
-        meetings = get_meetings_by_date(selected_date)
+        selected_date_label.config(text=label_text)
 
         if not meetings:
-            tk.Label(meetings_container, text="Δεν υπάρχουν meetings για αυτή την ημερομηνία.", bg="#ffffff", fg="#777777", font=("Arial", 10)).pack(anchor="w", pady=6)
+            tk.Label(
+                meetings_container,
+                text="Δεν υπάρχουν meetings για αυτό το φίλτρο.",
+                bg="#ffffff",
+                fg="#777777",
+                font=("Arial", 10)
+            ).pack(anchor="w", pady=6)
             return
 
         for meeting in meetings:
             box = tk.Frame(meetings_container, bg="#eef6ff", relief="groove", borderwidth=1, padx=8, pady=6)
             box.pack(fill="x", pady=4)
 
-            tk.Label(box, text=meeting["title"], font=("Arial", 11, "bold"), bg="#eef6ff", anchor="w").pack(fill="x")
-            tk.Label(box, text=meeting["note"] or "-", font=("Arial", 10), bg="#eef6ff", justify="left", anchor="w", wraplength=420).pack(fill="x", pady=(4, 2))
-            tk.Label(box, text=f"Καταχώριση: {meeting['created_at']}", font=("Arial", 8, "italic"), bg="#eef6ff", fg="#666666").pack(anchor="w")
+            tk.Label(
+                box,
+                text=f"{meeting['meeting_date']} - {meeting['title']}",
+                font=("Arial", 11, "bold"),
+                bg="#eef6ff",
+                anchor="w"
+            ).pack(fill="x")
 
-            def delete_action(meeting_id=meeting["id"], current_date=selected_date):
+            tk.Label(
+                box,
+                text=meeting["note"] or "-",
+                font=("Arial", 10),
+                bg="#eef6ff",
+                justify="left",
+                anchor="w",
+                wraplength=500
+            ).pack(fill="x", pady=(4, 2))
+
+            tk.Label(
+                box,
+                text=f"Καταχώριση: {meeting['created_at']}",
+                font=("Arial", 8, "italic"),
+                bg="#eef6ff",
+                fg="#666666"
+            ).pack(anchor="w")
+
+            def delete_action(meeting_id=meeting["id"]):
                 delete_meeting_db(meeting_id)
-                refresh_meetings_for_date(current_date)
+                apply_filter()
 
             tk.Button(box, text="Delete", bg="#f44336", fg="white", width=8, command=delete_action).pack(anchor="e", pady=(5, 0))
+
+    def apply_filter(event=None):
+        mode = view_mode.get()
+
+        if mode == "all":
+            meetings = get_all_meetings()
+            render_meetings(meetings, "Showing all meetings")
+            return
+
+        selected_date = filter_entry.get().strip()
+
+        try:
+            datetime.strptime(selected_date, "%Y-%m-%d")
+        except ValueError:
+            selected_date_label.config(text="Λάθος μορφή ημερομηνίας. Βάλε YYYY-MM-DD")
+            for widget in meetings_container.winfo_children():
+                widget.destroy()
+            return
+
+        meetings = get_meetings_by_date(selected_date)
+        render_meetings(meetings, f"Showing meetings for: {selected_date}")
 
     def add_meeting_action():
         meeting_date = date_entry.get().strip()
@@ -938,19 +1033,15 @@ def open_meetings():
 
         filter_entry.delete(0, tk.END)
         filter_entry.insert(0, meeting_date)
+        view_mode.set("date")
 
-        refresh_meetings_for_date(meeting_date)
-
-    def view_selected_date():
-        selected_date = filter_entry.get().strip()
-        refresh_meetings_for_date(selected_date)
+        apply_filter()
 
     tk.Button(left, text="Add Meeting", bg="#4CAF50", fg="white", width=16, command=add_meeting_action).pack(anchor="w", pady=8)
-    tk.Button(top_filter, text="View", bg="#2196F3", fg="white", width=10, command=view_selected_date).pack(side="left")
 
-    filter_entry.bind("<Return>", lambda e: view_selected_date())
+    filter_entry.bind("<Return>", apply_filter)
 
-    refresh_meetings_for_date(filter_entry.get().strip())
+    apply_filter()
 
 
 # ================= STOCKLIST WINDOW =================
@@ -961,7 +1052,7 @@ def open_stocklist():
     win.configure(bg="#f5f5f5")
 
     selected_file = {"path": None}
-    excel_data = {"sheets": {}, "current_sheet": None}
+    excel_data = {"sheets": {}}
 
     top_frame = tk.LabelFrame(win, text="Import Excel Stocklist", font=("Arial", 12, "bold"), bg="#f5f5f5", padx=10, pady=10)
     top_frame.pack(fill="x", padx=10, pady=10)
@@ -998,15 +1089,39 @@ def open_stocklist():
         cols_lower = {c.lower(): c for c in columns}
 
         group_candidates = [
-            "group", "groups", "category", "product group", "item group",
-            "family", "type", "brand", "department", "classification"
+            "title group",
+            "group",
+            "groups",
+            "category",
+            "product group",
+            "item group",
+            "family",
+            "type",
+            "brand",
+            "department",
+            "classification"
         ]
         price_candidates = [
-            "price", "unit price", "cost", "sale price", "stock price",
-            "amount", "value", "net price"
+            "finalprice",
+            "final price",
+            "price eur",
+            "price",
+            "unit price",
+            "cost",
+            "sale price",
+            "stock price",
+            "amount",
+            "value",
+            "net price"
         ]
         name_candidates = [
-            "item", "item name", "name", "description", "product", "product name"
+            "title",
+            "item",
+            "item name",
+            "name",
+            "description",
+            "product",
+            "product name"
         ]
 
         detected_group = ""
@@ -1046,17 +1161,17 @@ def open_stocklist():
 
     tk.Label(row2, text="Group column:", bg="#f5f5f5").pack(side="left")
     group_menu = tk.OptionMenu(row2, group_var, "")
-    group_menu.config(width=18)
+    group_menu.config(width=22)
     group_menu.pack(side="left", padx=(4, 12))
 
     tk.Label(row2, text="Price column:", bg="#f5f5f5").pack(side="left")
     price_menu = tk.OptionMenu(row2, price_var, "")
-    price_menu.config(width=18)
+    price_menu.config(width=22)
     price_menu.pack(side="left", padx=(4, 12))
 
     tk.Label(row2, text="Name column:", bg="#f5f5f5").pack(side="left")
     name_menu = tk.OptionMenu(row2, name_var, "")
-    name_menu.config(width=18)
+    name_menu.config(width=22)
     name_menu.pack(side="left", padx=(4, 0))
 
     info_label = tk.Label(top_frame, text="Total imported rows: 0", bg="#f5f5f5", fg="#333333", font=("Arial", 10, "bold"))
@@ -1077,7 +1192,7 @@ def open_stocklist():
     tree.heading("max", text="Max Price")
     tree.heading("avg", text="Avg Price")
 
-    tree.column("group", width=300, anchor="w")
+    tree.column("group", width=320, anchor="w")
     tree.column("count", width=100, anchor="center")
     tree.column("min", width=150, anchor="e")
     tree.column("max", width=150, anchor="e")
@@ -1143,6 +1258,8 @@ def open_stocklist():
         if detected_name in cols or detected_name == "":
             name_var.set(detected_name)
 
+        info_label.config(text=f"Loaded sheet rows: {len(df)}")
+
     def choose_excel_file():
         path = filedialog.askopenfilename(
             title="Select Excel file",
@@ -1152,16 +1269,18 @@ def open_stocklist():
             return
 
         try:
-            sheets = pd.read_excel(path, sheet_name=None)
-            if not sheets:
-                messagebox.showwarning("Warning", "Το Excel δεν περιέχει sheets.")
-                return
-
+            xls = pd.ExcelFile(path)
             cleaned = {}
-            for sheet_name, df in sheets.items():
+
+            for sheet_name in xls.sheet_names:
+                df = pd.read_excel(path, sheet_name=sheet_name, header=0)
                 df = df.copy()
                 df.columns = [str(c).strip() for c in df.columns]
                 cleaned[sheet_name] = df
+
+            if not cleaned:
+                messagebox.showwarning("Warning", "Το Excel δεν περιέχει sheets.")
+                return
 
             excel_data["sheets"] = cleaned
             selected_file["path"] = path
@@ -1188,9 +1307,11 @@ def open_stocklist():
         if not current_sheet:
             messagebox.showwarning("Warning", "Επίλεξε sheet.")
             return
+
         if current_sheet not in excel_data["sheets"]:
             messagebox.showwarning("Warning", "Το επιλεγμένο sheet δεν βρέθηκε.")
             return
+
         if not group_col or not price_col:
             messagebox.showwarning("Warning", "Επίλεξε Group column και Price column.")
             return
@@ -1202,19 +1323,30 @@ def open_stocklist():
             return
 
         df[group_col] = df[group_col].astype(str).str.strip()
-        df[price_col] = pd.to_numeric(df[price_col], errors="coerce")
+        df[group_col] = df[group_col].replace({"nan": "", "None": "", "NaN": ""})
+
+        df[price_col] = df[price_col].apply(clean_price_to_float)
 
         if name_col and name_col in df.columns:
-            df[name_col] = df[name_col].astype(str).str.strip()
+            df[name_col] = (
+                df[name_col]
+                .astype(str)
+                .str.strip()
+                .replace({"nan": "", "None": "", "NaN": ""})
+            )
         else:
             name_col = None
 
-        df = df[df[group_col].notna()]
         df = df[df[group_col] != ""]
         df = df[df[price_col].notna()]
+        df = df[df[price_col] > 0]
 
         if df.empty:
-            messagebox.showwarning("Warning", "Δεν βρέθηκαν έγκυρες γραμμές μετά το καθάρισμα των δεδομένων.")
+            messagebox.showwarning(
+                "Warning",
+                "Δεν βρέθηκαν έγκυρες γραμμές μετά το καθάρισμα των δεδομένων.\n"
+                "Έλεγξε αν το Group column είναι το σωστό group field και το Price column η τιμή σε EUR."
+            )
             return
 
         imported_at = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -1235,14 +1367,20 @@ def open_stocklist():
                 imported_at
             ))
 
-        if not messagebox.askyesno("Confirm Import", f"Θα γίνει αντικατάσταση του υπάρχοντος stocklist με {len(rows)} γραμμές. Συνέχεια;"):
+        if not messagebox.askyesno(
+            "Confirm Import",
+            f"Βρέθηκαν {len(rows)} έγκυρες γραμμές.\nΘα γίνει αντικατάσταση του υπάρχοντος stocklist.\nΣυνέχεια;"
+        ):
             return
 
         clear_stock_items_db()
         add_stock_rows_db(rows)
         refresh_stats_view()
 
-        messagebox.showinfo("Success", f"Έγινε import {len(rows)} γραμμών από το sheet '{current_sheet}'.")
+        messagebox.showinfo(
+            "Success",
+            f"Έγινε import {len(rows)} γραμμών από το sheet '{current_sheet}'."
+        )
 
     btn_row = tk.Frame(top_frame, bg="#f5f5f5")
     btn_row.pack(fill="x", pady=(8, 0))
@@ -1547,7 +1685,6 @@ def open_suppliers():
     refresh_all()
 
 
-# ================= MAIN =================
 init_db()
 
 root = tk.Tk()
@@ -1570,4 +1707,4 @@ tk.Button(btn_frame, text="Stocklist", width=18, height=2, bg="#795548", fg="whi
 footer = tk.Label(root, text="Local SQLite storage enabled", font=("Arial", 10, "italic"), bg="#f5f5f5", fg="#666")
 footer.pack(pady=(15, 0))
 
-root.mainloop().\.venv\Scripts\python.exe dashboard.py
+root.mainloop()
