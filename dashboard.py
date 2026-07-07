@@ -1,5 +1,6 @@
 import os
 import sys
+import sqlite3
 import subprocess
 import tkinter as tk
 from tkinter import messagebox, simpledialog, filedialog
@@ -7,10 +8,298 @@ from datetime import datetime
 
 CURRENCY_SYMBOLS = {"EUR": "€", "USD": "$", "JPY": "¥"}
 
+ATTACHMENT_TYPES = [
+    ("contract", "Contract"),
+    ("email", "Email"),
+    ("quote", "Price Quote"),
+]
 
+ATTACHMENT_FILETYPES = [
+    ("PDF files", "*.pdf"),
+    ("Word files", "*.doc *.docx"),
+    ("Excel files", "*.xls *.xlsx"),
+    ("Images", "*.jpg *.jpeg *.png"),
+    ("All files", "*.*"),
+]
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "dashboard.db")
+
+
+# ================= DATABASE =================
+def get_conn():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS emails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT,
+            subject TEXT NOT NULL,
+            body TEXT,
+            expanded INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            date TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS suppliers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            tel TEXT,
+            contact TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS supplier_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            supplier_id INTEGER NOT NULL,
+            type_key TEXT NOT NULL,
+            file_path TEXT,
+            FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE CASCADE
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS supplier_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            supplier_id INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            qty INTEGER NOT NULL,
+            price REAL NOT NULL,
+            currency TEXT NOT NULL,
+            FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE CASCADE
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# ================= EMAILS =================
+def get_all_emails():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM emails ORDER BY id DESC")
+    rows = [dict(row) for row in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def add_email_db(sender, subject, body, expanded=0):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO emails (sender, subject, body, expanded) VALUES (?, ?, ?, ?)",
+        (sender, subject, body, expanded)
+    )
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return new_id
+
+
+def update_email_db(email_id, sender, subject, body, expanded):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE emails
+        SET sender = ?, subject = ?, body = ?, expanded = ?
+        WHERE id = ?
+    """, (sender, subject, body, expanded, email_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_email_db(email_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM emails WHERE id = ?", (email_id,))
+    conn.commit()
+    conn.close()
+
+
+def set_email_expanded_db(email_id, expanded):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE emails SET expanded = ? WHERE id = ?", (expanded, email_id))
+    conn.commit()
+    conn.close()
+
+
+# ================= TASKS =================
+def get_all_tasks():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM tasks ORDER BY id DESC")
+    rows = [dict(row) for row in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def add_task_db(text, date, done=0):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO tasks (text, date, done) VALUES (?, ?, ?)",
+        (text, date, done)
+    )
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return new_id
+
+
+def update_task_db(task_id, text):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE tasks SET text = ? WHERE id = ?", (text, task_id))
+    conn.commit()
+    conn.close()
+
+
+def set_task_done_db(task_id, done):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE tasks SET done = ? WHERE id = ?", (done, task_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_task_db(task_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    conn.commit()
+    conn.close()
+
+
+# ================= SUPPLIERS =================
+def get_all_suppliers():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM suppliers ORDER BY id DESC")
+    supplier_rows = cur.fetchall()
+
+    suppliers = []
+    for row in supplier_rows:
+        supplier = dict(row)
+
+        cur.execute(
+            "SELECT type_key, file_path FROM supplier_attachments WHERE supplier_id = ?",
+            (supplier["id"],)
+        )
+        attachments = {r["type_key"]: r["file_path"] for r in cur.fetchall()}
+
+        cur.execute(
+            "SELECT * FROM supplier_items WHERE supplier_id = ? ORDER BY id DESC",
+            (supplier["id"],)
+        )
+        items = [dict(r) for r in cur.fetchall()]
+
+        supplier["attachments"] = attachments
+        supplier["items"] = items
+        suppliers.append(supplier)
+
+    conn.close()
+    return suppliers
+
+
+def add_supplier_db(name, tel, contact):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO suppliers (name, tel, contact) VALUES (?, ?, ?)",
+        (name, tel, contact)
+    )
+    supplier_id = cur.lastrowid
+
+    for key in ["contract", "email", "quote"]:
+        cur.execute(
+            "INSERT INTO supplier_attachments (supplier_id, type_key, file_path) VALUES (?, ?, ?)",
+            (supplier_id, key, None)
+        )
+
+    conn.commit()
+    conn.close()
+    return supplier_id
+
+
+def update_supplier_db(supplier_id, name, tel, contact):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE suppliers
+        SET name = ?, tel = ?, contact = ?
+        WHERE id = ?
+    """, (name, tel, contact, supplier_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_supplier_db(supplier_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM suppliers WHERE id = ?", (supplier_id,))
+    conn.commit()
+    conn.close()
+
+
+def set_supplier_attachment_db(supplier_id, type_key, file_path):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE supplier_attachments
+        SET file_path = ?
+        WHERE supplier_id = ? AND type_key = ?
+    """, (file_path, supplier_id, type_key))
+    conn.commit()
+    conn.close()
+
+
+def add_supplier_item_db(supplier_id, description, qty, price, currency):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO supplier_items (supplier_id, description, qty, price, currency)
+        VALUES (?, ?, ?, ?, ?)
+    """, (supplier_id, description, qty, price, currency))
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return new_id
+
+
+def delete_supplier_item_db(item_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM supplier_items WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+
+
+# ================= HELPERS =================
 def open_file(path):
-    """Open a file with the OS default application (cross-platform)."""
     try:
+        if not path:
+            return
         if sys.platform.startswith("win"):
             os.startfile(path)
         elif sys.platform == "darwin":
@@ -21,20 +310,7 @@ def open_file(path):
         messagebox.showerror("Error", f"Could not open file:\n{e}")
 
 
-# ---------- GLOBAL PERSISTENT DATA (Tasks module) ----------
-emails_data = [
-    {
-        "from": "user@example.com",
-        "subject": "Νέα παραγγελία προμηθευτή",
-        "body": "Καλημέρα, χρειαζόμαστε επιβεβαίωση παράδοσης για την παραγγελία #452 μέχρι Παρασκευή.",
-        "expanded": False
-    }
-]
-
-tasks_data = []  # {"text": str, "date": str, "done": bool}
-
-
-# ---------- TASKS WINDOW (email list + persistent to-do list) ----------
+# ================= TASKS WINDOW =================
 def open_tasks():
     win = tk.Toplevel(root)
     win.title("Tasks")
@@ -50,7 +326,6 @@ def open_tasks():
     right_frame = tk.Frame(main_frame, bg="#ffffff", width=400)
     right_frame.pack(side="right", fill="both", expand=True)
 
-    # ================= LEFT: EMAIL LIST PANE =================
     tk.Label(left_frame, text="Emails", font=("Arial", 14, "bold"), bg="#e0e0e0").pack(pady=(10, 5))
 
     new_email_btn_frame = tk.Frame(left_frame, bg="#e0e0e0")
@@ -60,10 +335,7 @@ def open_tasks():
     email_scrollbar = tk.Scrollbar(left_frame, orient="vertical", command=email_canvas.yview)
     emails_container = tk.Frame(email_canvas, bg="#e0e0e0")
 
-    emails_container.bind(
-        "<Configure>",
-        lambda e: email_canvas.configure(scrollregion=email_canvas.bbox("all"))
-    )
+    emails_container.bind("<Configure>", lambda e: email_canvas.configure(scrollregion=email_canvas.bbox("all")))
     email_canvas.create_window((0, 0), window=emails_container, anchor="nw")
     email_canvas.configure(yscrollcommand=email_scrollbar.set)
 
@@ -103,13 +375,21 @@ def open_tasks():
             header_row.pack(fill="x")
 
             arrow = "▼" if email_dict["expanded"] else "▶"
-            subject_lbl = tk.Label(header_row, text=f"{arrow} {email_dict['subject']}",
-                                    font=("Arial", 11, "bold"), bg="#cfe8ff",
-                                    anchor="w", wraplength=280, cursor="hand2", justify="left")
+            subject_lbl = tk.Label(
+                header_row,
+                text=f"{arrow} {email_dict['subject']}",
+                font=("Arial", 11, "bold"),
+                bg="#cfe8ff",
+                anchor="w",
+                wraplength=280,
+                cursor="hand2",
+                justify="left"
+            )
             subject_lbl.pack(side="left", fill="x", expand=True)
 
             def toggle_expand(event=None):
-                email_dict["expanded"] = not email_dict["expanded"]
+                email_dict["expanded"] = 0 if email_dict["expanded"] else 1
+                set_email_expanded_db(email_dict["id"], email_dict["expanded"])
                 refresh_card()
 
             subject_lbl.bind("<Button-1>", toggle_expand)
@@ -119,38 +399,50 @@ def open_tasks():
             btns_row = tk.Frame(header_row, bg="#cfe8ff")
             btns_row.pack(side="right")
 
-            def edit_email():
+            def edit_email_action():
                 new_subject = simpledialog.askstring("Edit Email", "Θέμα:", initialvalue=email_dict["subject"])
                 new_body = simpledialog.askstring("Edit Email", "Περιεχόμενο:", initialvalue=email_dict["body"])
+                new_sender = simpledialog.askstring("Edit Email", "From:", initialvalue=email_dict["sender"])
+
                 if new_subject:
                     email_dict["subject"] = new_subject
-                if new_body:
+                if new_body is not None:
                     email_dict["body"] = new_body
+                if new_sender is not None:
+                    email_dict["sender"] = new_sender
+
+                update_email_db(
+                    email_dict["id"],
+                    email_dict["sender"],
+                    email_dict["subject"],
+                    email_dict["body"],
+                    email_dict["expanded"]
+                )
                 refresh_card()
 
-            def delete_email():
-                emails_data.remove(email_dict)
+            def delete_email_action():
+                delete_email_db(email_dict["id"])
                 card.destroy()
 
             tk.Button(btns_row, text="Edit", width=5, bg="#2196F3", fg="white",
-                      command=edit_email).pack(side="left", padx=2)
+                      command=edit_email_action).pack(side="left", padx=2)
             tk.Button(btns_row, text="Delete", width=6, bg="#f44336", fg="white",
-                      command=delete_email).pack(side="left", padx=2)
+                      command=delete_email_action).pack(side="left", padx=2)
 
             if email_dict["expanded"]:
-                tk.Label(card, text=f"Από: {email_dict['from']}", font=("Arial", 9),
+                tk.Label(card, text=f"Από: {email_dict['sender']}", font=("Arial", 9),
                          bg="#cfe8ff", anchor="w").pack(fill="x", pady=(4, 2))
 
                 body_lbl = tk.Label(card, text=email_dict["body"], font=("Arial", 10),
-                                     bg="#d9f2d9", anchor="w", justify="left",
-                                     wraplength=320, cursor="hand2", relief="raised", padx=8, pady=6)
+                                    bg="#d9f2d9", anchor="w", justify="left",
+                                    wraplength=320, cursor="hand2", relief="raised", padx=8, pady=6)
                 body_lbl.pack(fill="x", pady=(0, 4))
 
                 body_lbl.bind("<ButtonPress-1>", on_drag_start(lambda: email_dict["body"]))
                 body_lbl.bind("<ButtonRelease-1>", on_drag_release)
 
                 tk.Label(card, text="↳ Σύρε το Θέμα ή το Κείμενο στη λίστα Tasks δεξιά →",
-                          font=("Arial", 8, "italic"), bg="#cfe8ff", fg="#555").pack(pady=(0, 2))
+                         font=("Arial", 8, "italic"), bg="#cfe8ff", fg="#555").pack(pady=(0, 2))
 
         refresh_card()
 
@@ -175,17 +467,22 @@ def open_tasks():
         body_text.pack(fill="both", expand=True, padx=15)
 
         def submit_email():
+            sender = from_entry.get().strip() or "unknown@example.com"
             subject = subject_entry.get().strip()
             body = body_text.get("1.0", "end").strip()
-            sender = from_entry.get().strip() or "unknown@example.com"
 
             if not subject:
                 messagebox.showwarning("Προσοχή", "Το Subject είναι υποχρεωτικό.")
                 return
 
-            new_email = {"from": sender, "subject": subject, "body": body, "expanded": False}
-            emails_data.append(new_email)
-            render_email_card(new_email)
+            email_id = add_email_db(sender, subject, body, 0)
+            render_email_card({
+                "id": email_id,
+                "sender": sender,
+                "subject": subject,
+                "body": body,
+                "expanded": 0
+            })
             form.destroy()
 
         btn_frame = tk.Frame(form, bg="#f5f5f5")
@@ -199,10 +496,9 @@ def open_tasks():
     tk.Button(new_email_btn_frame, text="+ Νέο Email", bg="#4CAF50", fg="white",
               command=open_new_email_form).pack()
 
-    for existing_email in emails_data:
+    for existing_email in get_all_emails():
         render_email_card(existing_email)
 
-    # ================= RIGHT: TO-DO LIST PANE =================
     tk.Label(right_frame, text="To-Do List", font=("Arial", 14, "bold"), bg="#ffffff").pack(pady=(10, 5))
 
     entry_frame = tk.Frame(right_frame, bg="#ffffff")
@@ -215,10 +511,7 @@ def open_tasks():
     task_scrollbar = tk.Scrollbar(right_frame, orient="vertical", command=task_canvas.yview)
     tasks_container = tk.Frame(task_canvas, bg="#ffffff")
 
-    tasks_container.bind(
-        "<Configure>",
-        lambda e: task_canvas.configure(scrollregion=task_canvas.bbox("all"))
-    )
+    tasks_container.bind("<Configure>", lambda e: task_canvas.configure(scrollregion=task_canvas.bbox("all")))
     task_canvas.create_window((0, 0), window=tasks_container, anchor="nw")
     task_canvas.configure(yscrollcommand=task_scrollbar.set)
 
@@ -236,10 +529,11 @@ def open_tasks():
             top_row = tk.Frame(row_outer, bg="#ffffff")
             top_row.pack(fill="x")
 
-            done_var = tk.BooleanVar(value=task_dict["done"])
+            done_var = tk.BooleanVar(value=bool(task_dict["done"]))
 
             def toggle_done():
-                task_dict["done"] = done_var.get()
+                task_dict["done"] = 1 if done_var.get() else 0
+                set_task_done_db(task_dict["id"], task_dict["done"])
                 refresh_row()
 
             tk.Checkbutton(top_row, variable=done_var, bg="#ffffff", command=toggle_done).pack(side="left")
@@ -248,38 +542,42 @@ def open_tasks():
             task_color = "#999999" if task_dict["done"] else "#000000"
 
             tk.Label(top_row, text=task_dict["text"], font=task_font, fg=task_color,
-                     bg="#ffffff", anchor="w", justify="left",
-                     wraplength=220).pack(side="left", fill="x", expand=True)
+                     bg="#ffffff", anchor="w", justify="left", wraplength=220).pack(side="left", fill="x", expand=True)
 
-            def edit_task():
+            def edit_task_action():
                 new_text = simpledialog.askstring("Edit Task", "Επεξεργασία task:", initialvalue=task_dict["text"])
                 if new_text:
                     task_dict["text"] = new_text
+                    update_task_db(task_dict["id"], new_text)
                     refresh_row()
 
-            def delete_task():
-                tasks_data.remove(task_dict)
+            def delete_task_action():
+                delete_task_db(task_dict["id"])
                 row_outer.destroy()
 
             tk.Button(top_row, text="Edit", width=5, bg="#2196F3", fg="white",
-                      command=edit_task).pack(side="left", padx=2)
+                      command=edit_task_action).pack(side="left", padx=2)
             tk.Button(top_row, text="Delete", width=6, bg="#f44336", fg="white",
-                      command=delete_task).pack(side="left", padx=2)
+                      command=delete_task_action).pack(side="left", padx=2)
 
             bottom_row = tk.Frame(row_outer, bg="#ffffff")
             bottom_row.pack(fill="x", pady=(2, 0))
             tk.Label(bottom_row, text=f"📅 Καταχωρήθηκε: {task_dict['date']}",
-                     font=("Arial", 8, "italic"), fg="#777777", bg="#ffffff",
-                     anchor="w").pack(side="left")
+                     font=("Arial", 8, "italic"), fg="#777777", bg="#ffffff").pack(side="left")
 
         refresh_row()
 
     def add_task_row(text):
-        task_dict = {"text": text, "date": datetime.now().strftime("%d/%m/%Y %H:%M"), "done": False}
-        tasks_data.append(task_dict)
-        render_task_row(task_dict)
+        date_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+        task_id = add_task_db(text, date_str, 0)
+        render_task_row({
+            "id": task_id,
+            "text": text,
+            "date": date_str,
+            "done": 0
+        })
 
-    def add_task(event=None):
+    def add_task_action(event=None):
         text = task_entry.get().strip()
         if not text:
             messagebox.showwarning("Προσοχή", "Γράψε ένα task πρώτα.")
@@ -287,37 +585,24 @@ def open_tasks():
         add_task_row(text)
         task_entry.delete(0, tk.END)
 
-    tk.Button(entry_frame, text="Add Task", bg="#4CAF50", fg="white", command=add_task).pack(side="left")
-    task_entry.bind("<Return>", add_task)
+    tk.Button(entry_frame, text="Add Task", bg="#4CAF50", fg="white", command=add_task_action).pack(side="left")
+    task_entry.bind("<Return>", add_task_action)
 
-    for existing_task in tasks_data:
+    for existing_task in get_all_tasks():
         render_task_row(existing_task)
 
 
-# ---------- SUPPLIERS WINDOW ----------
+# ================= SUPPLIERS WINDOW =================
 def open_suppliers():
     win = tk.Toplevel(root)
     win.title("Suppliers")
     win.geometry("980x700")
     win.configure(bg="#f5f5f5")
 
-    suppliers = []
-
-    ATTACHMENT_TYPES = [
-        ("contract", "Contract"),
-        ("email", "Email"),
-        ("quote", "Price Quote"),
-    ]
-    ATTACHMENT_FILETYPES = [
-        ("PDF files", "*.pdf"),
-        ("Word files", "*.doc *.docx"),
-        ("Excel files", "*.xls *.xlsx"),
-        ("Images", "*.jpg *.jpeg"),
-        ("All files", "*.*"),
-    ]
+    supplier_map = {}
 
     form_frame = tk.LabelFrame(win, text="Add Supplier", font=("Arial", 12, "bold"),
-                                bg="#f5f5f5", padx=10, pady=10)
+                               bg="#f5f5f5", padx=10, pady=10)
     form_frame.pack(fill="x", padx=10, pady=10)
 
     tk.Label(form_frame, text="Name:", bg="#f5f5f5").grid(row=0, column=0, sticky="w")
@@ -332,30 +617,6 @@ def open_suppliers():
     contact_entry = tk.Entry(form_frame, width=18)
     contact_entry.grid(row=0, column=5, padx=5, pady=3)
 
-    def add_supplier():
-        name = name_entry.get().strip()
-        tel = tel_entry.get().strip()
-        contact = contact_entry.get().strip()
-        if not name:
-            messagebox.showwarning("Προσοχή", "Το πεδίο Name είναι υποχρεωτικό.")
-            return
-        supplier = {
-            "name": name,
-            "tel": tel,
-            "contact": contact,
-            "attachments": {key: None for key, _ in ATTACHMENT_TYPES},
-            "items": [],
-        }
-        suppliers.append(supplier)
-        add_supplier_row(supplier)
-        refresh_supplier_menu()
-        name_entry.delete(0, tk.END)
-        tel_entry.delete(0, tk.END)
-        contact_entry.delete(0, tk.END)
-
-    tk.Button(form_frame, text="Add Supplier", bg="#4CAF50", fg="white",
-              command=add_supplier).grid(row=0, column=6, padx=10)
-
     tk.Label(win, text="Suppliers", font=("Arial", 13, "bold"), bg="#f5f5f5").pack(anchor="w", padx=12)
 
     suppliers_outer = tk.Frame(win, bg="#f5f5f5", height=230)
@@ -366,93 +627,14 @@ def open_suppliers():
     s_scroll = tk.Scrollbar(suppliers_outer, orient="vertical", command=s_canvas.yview)
     suppliers_container = tk.Frame(s_canvas, bg="#ffffff")
 
-    suppliers_container.bind(
-        "<Configure>", lambda e: s_canvas.configure(scrollregion=s_canvas.bbox("all"))
-    )
+    suppliers_container.bind("<Configure>", lambda e: s_canvas.configure(scrollregion=s_canvas.bbox("all")))
     s_canvas.create_window((0, 0), window=suppliers_container, anchor="nw")
     s_canvas.configure(yscrollcommand=s_scroll.set)
     s_canvas.pack(side="left", fill="both", expand=True)
     s_scroll.pack(side="right", fill="y")
 
-    def add_supplier_row(supplier):
-        row_outer = tk.Frame(suppliers_container, bg="#ffffff", relief="groove", borderwidth=1, pady=6, padx=6)
-        row_outer.pack(fill="x", pady=4, padx=2)
-
-        def refresh_row():
-            for widget in row_outer.winfo_children():
-                widget.destroy()
-
-            info_row = tk.Frame(row_outer, bg="#ffffff")
-            info_row.pack(fill="x")
-
-            tk.Label(info_row, text=supplier["name"], font=("Arial", 11, "bold"),
-                     bg="#ffffff", anchor="w", width=20).pack(side="left")
-            tk.Label(info_row, text=f"Tel: {supplier['tel'] or '-'}", font=("Arial", 10),
-                     bg="#ffffff", anchor="w", width=18).pack(side="left")
-            tk.Label(info_row, text=f"Contact: {supplier['contact'] or '-'}", font=("Arial", 10),
-                     bg="#ffffff", anchor="w", width=22).pack(side="left")
-
-            def edit_supplier():
-                new_name = simpledialog.askstring("Edit Supplier", "Name:", initialvalue=supplier["name"])
-                new_tel = simpledialog.askstring("Edit Supplier", "Tel:", initialvalue=supplier["tel"])
-                new_contact = simpledialog.askstring("Edit Supplier", "Contact:", initialvalue=supplier["contact"])
-                if new_name:
-                    supplier["name"] = new_name
-                supplier["tel"] = new_tel or ""
-                supplier["contact"] = new_contact or ""
-                refresh_row()
-                refresh_supplier_menu()
-
-            def delete_supplier():
-                if not messagebox.askyesno("Delete", f"Διαγραφή προμηθευτή '{supplier['name']}';"):
-                    return
-                suppliers.remove(supplier)
-                row_outer.destroy()
-                refresh_supplier_menu()
-
-            tk.Button(info_row, text="Edit", width=5, bg="#2196F3", fg="white",
-                      command=edit_supplier).pack(side="left", padx=2)
-            tk.Button(info_row, text="Delete", width=6, bg="#f44336", fg="white",
-                      command=delete_supplier).pack(side="left", padx=2)
-
-            attach_row = tk.Frame(row_outer, bg="#ffffff")
-            attach_row.pack(fill="x", pady=(4, 0))
-            tk.Label(attach_row, text="Attachments:", font=("Arial", 9, "italic"),
-                     bg="#ffffff", fg="#555").pack(side="left", padx=(0, 6))
-
-            for key, label in ATTACHMENT_TYPES:
-                build_attachment_widget(attach_row, supplier, key, label, refresh_row)
-
-        refresh_row()
-
-    def build_attachment_widget(parent, supplier, key, label, refresh_row):
-        cell = tk.Frame(parent, bg="#ffffff")
-        cell.pack(side="left", padx=6)
-
-        path = supplier["attachments"].get(key)
-        filename = os.path.basename(path) if path else "— none —"
-
-        tk.Label(cell, text=f"{label}:", font=("Arial", 9), bg="#ffffff").pack(side="left")
-        tk.Label(cell, text=filename, font=("Arial", 9, "italic"), bg="#ffffff",
-                 fg="#2e7d32" if path else "#999999", width=14, anchor="w").pack(side="left", padx=(2, 4))
-
-        def browse():
-            chosen = filedialog.askopenfilename(title=f"Select {label} file", filetypes=ATTACHMENT_FILETYPES)
-            if chosen:
-                supplier["attachments"][key] = chosen
-                refresh_row()
-
-        def open_attachment():
-            if path:
-                open_file(path)
-            else:
-                messagebox.showinfo(label, "Δεν έχει επισυναφθεί αρχείο ακόμα.")
-
-        tk.Button(cell, text="Browse", width=6, bg="#607d8b", fg="white", command=browse).pack(side="left", padx=1)
-        tk.Button(cell, text="Open", width=5, bg="#795548", fg="white", command=open_attachment).pack(side="left", padx=1)
-
     quote_frame = tk.LabelFrame(win, text="Price Quotes", font=("Arial", 12, "bold"),
-                                 bg="#f5f5f5", padx=10, pady=10)
+                                bg="#f5f5f5", padx=10, pady=10)
     quote_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
     control_row = tk.Frame(quote_frame, bg="#f5f5f5")
@@ -461,7 +643,7 @@ def open_suppliers():
     tk.Label(control_row, text="Supplier:", bg="#f5f5f5").pack(side="left")
     selected_supplier = tk.StringVar(value="")
     supplier_menu = tk.OptionMenu(control_row, selected_supplier, "")
-    supplier_menu.config(width=16)
+    supplier_menu.config(width=20)
     supplier_menu.pack(side="left", padx=(4, 12))
 
     tk.Label(control_row, text="Description:", bg="#f5f5f5").pack(side="left")
@@ -486,80 +668,114 @@ def open_suppliers():
     i_scroll = tk.Scrollbar(items_outer, orient="vertical", command=i_canvas.yview)
     items_container = tk.Frame(i_canvas, bg="#ffffff")
 
-    items_container.bind(
-        "<Configure>", lambda e: i_canvas.configure(scrollregion=i_canvas.bbox("all"))
-    )
+    items_container.bind("<Configure>", lambda e: i_canvas.configure(scrollregion=i_canvas.bbox("all")))
     i_canvas.create_window((0, 0), window=items_container, anchor="nw")
     i_canvas.configure(yscrollcommand=i_scroll.set)
     i_canvas.pack(side="left", fill="both", expand=True)
     i_scroll.pack(side="right", fill="y")
 
     summary_label = tk.Label(quote_frame, text="Min: -    Max: -    Average: -",
-                              font=("Arial", 11, "bold"), bg="#f5f5f5", anchor="w")
+                             font=("Arial", 11, "bold"), bg="#f5f5f5", anchor="w")
     summary_label.pack(fill="x", pady=(8, 0))
 
-    def get_selected_supplier():
-        target_name = selected_supplier.get()
-        for s in suppliers:
-            if s["name"] == target_name:
+    def get_supplier_by_selected():
+        supplier_id = supplier_map.get(selected_supplier.get())
+        if not supplier_id:
+            return None
+        for s in get_all_suppliers():
+            if s["id"] == supplier_id:
                 return s
         return None
 
-    def refresh_supplier_menu():
-        menu = supplier_menu["menu"]
-        menu.delete(0, "end")
-        names = [s["name"] for s in suppliers]
+    def build_attachment_widget(parent, supplier, key, label):
+        cell = tk.Frame(parent, bg="#ffffff")
+        cell.pack(side="left", padx=6)
 
-        def pick(n):
-            selected_supplier.set(n)
-            refresh_items_view()
+        path = supplier["attachments"].get(key)
+        filename = os.path.basename(path) if path else "— none —"
 
-        for n in names:
-            menu.add_command(label=n, command=lambda n=n: pick(n))
+        tk.Label(cell, text=f"{label}:", font=("Arial", 9), bg="#ffffff").pack(side="left")
+        tk.Label(cell, text=filename, font=("Arial", 9, "italic"), bg="#ffffff",
+                 fg="#2e7d32" if path else "#999999", width=14, anchor="w").pack(side="left", padx=(2, 4))
 
-        if names and selected_supplier.get() not in names:
-            selected_supplier.set(names[0])
-        elif not names:
-            selected_supplier.set("")
-        refresh_items_view()
+        def browse():
+            chosen = filedialog.askopenfilename(title=f"Select {label} file", filetypes=ATTACHMENT_FILETYPES)
+            if chosen:
+                set_supplier_attachment_db(supplier["id"], key, chosen)
+                refresh_all()
 
-    def refresh_items_view():
-        for widget in items_container.winfo_children():
-            widget.destroy()
+        def open_attachment():
+            if path:
+                open_file(path)
+            else:
+                messagebox.showinfo(label, "Δεν έχει επισυναφθεί αρχείο ακόμα.")
 
-        supplier = get_selected_supplier()
-        if supplier is None:
-            tk.Label(items_container, text="Επίλεξε ή πρόσθεσε έναν προμηθευτή πρώτα.",
-                     bg="#ffffff", fg="#777").pack(anchor="w", padx=6, pady=6)
-            summary_label.config(text="Min: -    Max: -    Average: -")
-            return
+        tk.Button(cell, text="Browse", width=6, bg="#607d8b", fg="white", command=browse).pack(side="left", padx=1)
+        tk.Button(cell, text="Open", width=5, bg="#795548", fg="white", command=open_attachment).pack(side="left", padx=1)
 
-        for item in supplier["items"]:
-            add_item_row(supplier, item)
+    def add_supplier_row(supplier):
+        row_outer = tk.Frame(suppliers_container, bg="#ffffff", relief="groove", borderwidth=1, pady=6, padx=6)
+        row_outer.pack(fill="x", pady=4, padx=2)
 
-        update_summary(supplier)
+        info_row = tk.Frame(row_outer, bg="#ffffff")
+        info_row.pack(fill="x")
 
-    def add_item_row(supplier, item):
+        tk.Label(info_row, text=supplier["name"], font=("Arial", 11, "bold"),
+                 bg="#ffffff", anchor="w", width=20).pack(side="left")
+        tk.Label(info_row, text=f"Tel: {supplier['tel'] or '-'}", font=("Arial", 10),
+                 bg="#ffffff", anchor="w", width=18).pack(side="left")
+        tk.Label(info_row, text=f"Contact: {supplier['contact'] or '-'}", font=("Arial", 10),
+                 bg="#ffffff", anchor="w", width=22).pack(side="left")
+
+        def edit_supplier_action():
+            new_name = simpledialog.askstring("Edit Supplier", "Name:", initialvalue=supplier["name"])
+            new_tel = simpledialog.askstring("Edit Supplier", "Tel:", initialvalue=supplier["tel"])
+            new_contact = simpledialog.askstring("Edit Supplier", "Contact:", initialvalue=supplier["contact"])
+
+            if new_name:
+                update_supplier_db(supplier["id"], new_name, new_tel or "", new_contact or "")
+                refresh_all()
+
+        def delete_supplier_action():
+            if not messagebox.askyesno("Delete", f"Διαγραφή προμηθευτή '{supplier['name']}';"):
+                return
+            delete_supplier_db(supplier["id"])
+            refresh_all()
+
+        tk.Button(info_row, text="Edit", width=5, bg="#2196F3", fg="white",
+                  command=edit_supplier_action).pack(side="left", padx=2)
+        tk.Button(info_row, text="Delete", width=6, bg="#f44336", fg="white",
+                  command=delete_supplier_action).pack(side="left", padx=2)
+
+        attach_row = tk.Frame(row_outer, bg="#ffffff")
+        attach_row.pack(fill="x", pady=(4, 0))
+        tk.Label(attach_row, text="Attachments:", font=("Arial", 9, "italic"),
+                 bg="#ffffff", fg="#555").pack(side="left", padx=(0, 6))
+
+        for key, label in ATTACHMENT_TYPES:
+            build_attachment_widget(attach_row, supplier, key, label)
+
+    def add_item_row(item):
         symbol = CURRENCY_SYMBOLS.get(item["currency"], item["currency"])
         total = item["qty"] * item["price"]
 
         row = tk.Frame(items_container, bg="#ffffff", relief="groove", borderwidth=1, padx=6, pady=4)
         row.pack(fill="x", padx=2, pady=2)
 
-        tk.Label(row, text=item["desc"], bg="#ffffff", anchor="w", width=22).pack(side="left")
+        tk.Label(row, text=item["description"], bg="#ffffff", anchor="w", width=22).pack(side="left")
         tk.Label(row, text=f"Qty: {item['qty']}", bg="#ffffff", anchor="w", width=8).pack(side="left")
         tk.Label(row, text=f"Price: {symbol}{item['price']:.2f}", bg="#ffffff", anchor="w", width=16).pack(side="left")
         tk.Label(row, text=f"Total: {symbol}{total:.2f}", bg="#ffffff", anchor="w", width=16,
                  font=("Arial", 10, "bold")).pack(side="left")
 
-        def delete_item():
-            supplier["items"].remove(item)
-            refresh_items_view()
+        def delete_item_action():
+            delete_supplier_item_db(item["id"])
+            refresh_all()
 
-        tk.Button(row, text="Delete", width=6, bg="#f44336", fg="white", command=delete_item).pack(side="left", padx=4)
+        tk.Button(row, text="Delete", width=6, bg="#f44336", fg="white", command=delete_item_action).pack(side="left", padx=4)
 
     def update_summary(supplier):
-        if not supplier["items"]:
+        if not supplier or not supplier["items"]:
             summary_label.config(text="Min: -    Max: -    Average: -")
             return
 
@@ -570,13 +786,81 @@ def open_suppliers():
         parts = []
         for currency, prices in by_currency.items():
             symbol = CURRENCY_SYMBOLS.get(currency, currency)
-            min_p, max_p, avg_p = min(prices), max(prices), sum(prices) / len(prices)
+            min_p = min(prices)
+            max_p = max(prices)
+            avg_p = sum(prices) / len(prices)
             parts.append(f"[{currency}] Min: {symbol}{min_p:.2f}   Max: {symbol}{max_p:.2f}   Average: {symbol}{avg_p:.2f}")
 
         summary_label.config(text="    ".join(parts))
 
-    def add_item():
-        supplier = get_selected_supplier()
+    def refresh_supplier_menu():
+        menu = supplier_menu["menu"]
+        menu.delete(0, "end")
+        supplier_map.clear()
+
+        suppliers = get_all_suppliers()
+        names = []
+
+        for s in suppliers:
+            display_name = f"{s['name']} (ID:{s['id']})"
+            supplier_map[display_name] = s["id"]
+            names.append(display_name)
+
+        def pick(name):
+            selected_supplier.set(name)
+            refresh_items_view()
+
+        for name in names:
+            menu.add_command(label=name, command=lambda n=name: pick(n))
+
+        if names and selected_supplier.get() not in names:
+            selected_supplier.set(names[0])
+        elif not names:
+            selected_supplier.set("")
+
+    def refresh_items_view():
+        for widget in items_container.winfo_children():
+            widget.destroy()
+
+        supplier = get_supplier_by_selected()
+        if supplier is None:
+            tk.Label(items_container, text="Επίλεξε ή πρόσθεσε έναν προμηθευτή πρώτα.",
+                     bg="#ffffff", fg="#777").pack(anchor="w", padx=6, pady=6)
+            summary_label.config(text="Min: -    Max: -    Average: -")
+            return
+
+        for item in supplier["items"]:
+            add_item_row(item)
+
+        update_summary(supplier)
+
+    def refresh_all():
+        for widget in suppliers_container.winfo_children():
+            widget.destroy()
+
+        for supplier in get_all_suppliers():
+            add_supplier_row(supplier)
+
+        refresh_supplier_menu()
+        refresh_items_view()
+
+    def add_supplier_action():
+        name = name_entry.get().strip()
+        tel = tel_entry.get().strip()
+        contact = contact_entry.get().strip()
+
+        if not name:
+            messagebox.showwarning("Προσοχή", "Το πεδίο Name είναι υποχρεωτικό.")
+            return
+
+        add_supplier_db(name, tel, contact)
+        name_entry.delete(0, tk.END)
+        tel_entry.delete(0, tk.END)
+        contact_entry.delete(0, tk.END)
+        refresh_all()
+
+    def add_item_action():
+        supplier = get_supplier_by_selected()
         if supplier is None:
             messagebox.showwarning("Προσοχή", "Πρόσθεσε πρώτα έναν προμηθευτή.")
             return
@@ -602,31 +886,37 @@ def open_suppliers():
             messagebox.showwarning("Προσοχή", "Το Price πρέπει να είναι αριθμός.")
             return
 
-        item = {"desc": desc, "qty": qty, "price": price, "currency": currency_var.get()}
-        supplier["items"].append(item)
-        refresh_items_view()
-
+        add_supplier_item_db(supplier["id"], desc, qty, price, currency_var.get())
         desc_entry.delete(0, tk.END)
         qty_entry.delete(0, tk.END)
         price_entry.delete(0, tk.END)
+        refresh_all()
 
-    tk.Button(control_row, text="Add Item", bg="#4CAF50", fg="white", command=add_item).pack(side="left")
+    tk.Button(form_frame, text="Add Supplier", bg="#4CAF50", fg="white",
+              command=add_supplier_action).grid(row=0, column=6, padx=10)
 
-    refresh_supplier_menu()
+    tk.Button(control_row, text="Add Item", bg="#4CAF50", fg="white",
+              command=add_item_action).pack(side="left")
+
+    refresh_all()
 
 
-# ---------- OTHER PLACEHOLDER FUNCTIONS ----------
+# ================= PLACEHOLDERS =================
 def open_meetings():
     messagebox.showinfo("Meetings", "Άνοιξε η σελίδα Meetings")
 
+
 def open_members():
     messagebox.showinfo("Members", "Άνοιξε η σελίδα Members")
+
 
 def open_stocklist():
     messagebox.showinfo("Stocklist", "Άνοιξε η σελίδα Stocklist")
 
 
-# ---------- MAIN DASHBOARD ----------
+# ================= MAIN =================
+init_db()
+
 root = tk.Tk()
 root.title("Dashboard")
 root.geometry("400x400")
