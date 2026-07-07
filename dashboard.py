@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import sqlite3
 import subprocess
@@ -23,6 +24,34 @@ ATTACHMENT_FILETYPES = [
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "dashboard.db")
+
+# ================= SUPPLIER FIELD VALIDATION =================
+# Name: letters (Greek or Latin) and numbers only (plus spaces).
+SUPPLIER_NAME_PATTERN = re.compile(r"^[A-Za-zΑ-Ωα-ωΆΈΉΊΌΎΏάέήίόύώϊϋΐΰ0-9\s]+$")
+# Tel: numbers and phone-style symbols only (+, -, (, ), space, /, .).
+SUPPLIER_TEL_PATTERN = re.compile(r"^[0-9+\-()/.\s]+$")
+# Contract: both letters/numbers and symbols are allowed — just block empty
+# after stripping.
+SUPPLIER_CONTRACT_PATTERN = re.compile(r"^.+$")
+
+
+def validate_supplier_fields(name, tel, contact):
+    """Returns an error message string if invalid, or None if all fields
+    that were actually filled in pass their format rules. Name is required;
+    Tel and Contract are optional but must match their format if provided."""
+    if not name:
+        return "Το πεδίο Name είναι υποχρεωτικό."
+
+    if not SUPPLIER_NAME_PATTERN.match(name):
+        return "Το Name επιτρέπει μόνο γράμματα και αριθμούς."
+
+    if tel and not SUPPLIER_TEL_PATTERN.match(tel):
+        return "Το Tel επιτρέπει μόνο αριθμούς και σύμβολα (+, -, (, ), /, .)."
+
+    if contact and not SUPPLIER_CONTRACT_PATTERN.match(contact):
+        return "Το Contract δεν μπορεί να είναι κενό."
+
+    return None
 
 
 def get_conn():
@@ -218,10 +247,18 @@ def delete_task_db(task_id):
 
 
 # ================= SUPPLIERS =================
-def get_all_suppliers():
+def get_all_suppliers(order_by="date"):
+    """order_by: "date" = registration order, newest first (id is assigned
+    strictly in insertion order, so it doubles as a registration-date sort
+    without needing a separate timestamp column). "name" = alphabetical."""
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM suppliers ORDER BY id DESC")
+
+    if order_by == "name":
+        cur.execute("SELECT * FROM suppliers ORDER BY name COLLATE NOCASE ASC")
+    else:
+        cur.execute("SELECT * FROM suppliers ORDER BY id DESC")
+
     supplier_rows = cur.fetchall()
 
     suppliers = []
@@ -455,11 +492,114 @@ def open_file(path):
         messagebox.showerror("Error", f"Could not open file:\n{e}")
 
 
+def make_button(parent, text, command, bg="#4CAF50", fg="white",
+                 font=("Arial", 10), width=None, height=None, padx=10, pady=4):
+    """A colored, clickable Label styled to look like a button.
+
+    On macOS, the native "Aqua" theme ignores custom bg/fg colors on
+    tk.Button (a long-standing Tk platform limitation) — buttons always
+    render as plain gray/white system buttons no matter what colors are
+    configured. Windows' Tk theme does not have this restriction. Using a
+    styled Label instead of a real Button sidesteps that limitation and
+    renders identically on macOS, Windows, and Linux.
+    """
+    kwargs = dict(text=text, bg=bg, fg=fg, font=font, relief="raised",
+                  borderwidth=2, cursor="hand2", padx=padx, pady=pady)
+    if width is not None:
+        kwargs["width"] = width
+    if height is not None:
+        kwargs["height"] = height
+
+    btn = tk.Label(parent, **kwargs)
+    btn.bind("<Button-1>", lambda event: command())
+    btn.bind("<Enter>", lambda event: btn.config(relief="sunken"))
+    btn.bind("<Leave>", lambda event: btn.config(relief="raised"))
+    return btn
+
+
+# Entry/Text fields elsewhere in this file are created with no explicit
+# colors (e.g. tk.Entry(form_frame, width=22)). On some macOS + Tk 9.x
+# setups, unstyled Entry/Text widgets pick up the system Dark Mode default
+# (black background, black text/cursor) even while the app's own Frames and
+# Labels stay correctly light-themed because THEY do set explicit colors.
+# That's why entry boxes render as solid black rectangles. Patching the
+# constructors here forces white/black defaults on every Entry and Text
+# widget without having to edit each of the ~18 call sites individually —
+# any call site that DOES pass its own bg/fg still wins (setdefault only
+# fills in what's missing).
+_original_entry_init = tk.Entry.__init__
+
+
+def _patched_entry_init(self, master=None, **kwargs):
+    kwargs.setdefault("bg", "white")
+    kwargs.setdefault("fg", "black")
+    kwargs.setdefault("insertbackground", "black")
+    kwargs.setdefault("highlightthickness", 1)
+    kwargs.setdefault("relief", "sunken")
+    _original_entry_init(self, master, **kwargs)
+
+
+tk.Entry.__init__ = _patched_entry_init
+
+_original_text_init = tk.Text.__init__
+
+
+def _patched_text_init(self, master=None, **kwargs):
+    kwargs.setdefault("bg", "white")
+    kwargs.setdefault("fg", "black")
+    kwargs.setdefault("insertbackground", "black")
+    kwargs.setdefault("relief", "sunken")
+    _original_text_init(self, master, **kwargs)
+
+
+tk.Text.__init__ = _patched_text_init
+
+# Same root cause hits plain Labels and LabelFrame titles too: every Label
+# call in this file sets bg= explicitly, but most don't set fg=, so text
+# color falls back to this Mac/Tk combo's default — which renders as
+# near-invisible pale/white text on the light backgrounds used everywhere
+# here (e.g. "Name:", "Job Title:", the "New Employee" section title).
+# Default fg to black the same way, without touching any bg or any fg a
+# call site already sets explicitly.
+_original_label_init = tk.Label.__init__
+
+
+def _patched_label_init(self, master=None, **kwargs):
+    kwargs.setdefault("fg", "black")
+    _original_label_init(self, master, **kwargs)
+
+
+tk.Label.__init__ = _patched_label_init
+
+_original_labelframe_init = tk.LabelFrame.__init__
+
+
+def _patched_labelframe_init(self, master=None, **kwargs):
+    kwargs.setdefault("fg", "black")
+    _original_labelframe_init(self, master, **kwargs)
+
+
+tk.LabelFrame.__init__ = _patched_labelframe_init
+
+
+def center_window(win, width, height):
+    """Center a window on screen and lock its minimum size so the manual
+    pack()/grid() layouts inside it don't get squashed if someone drags
+    the window smaller than it was designed for."""
+    win.update_idletasks()
+    screen_w = win.winfo_screenwidth()
+    screen_h = win.winfo_screenheight()
+    x = max((screen_w - width) // 2, 0)
+    y = max((screen_h - height) // 3, 0)
+    win.geometry(f"{width}x{height}+{x}+{y}")
+    win.minsize(width, height)
+
+
 # ================= TASKS WINDOW =================
 def open_tasks():
     win = tk.Toplevel(root)
     win.title("Tasks")
-    win.geometry("850x550")
+    center_window(win, 850, 550)
     win.configure(bg="#f5f5f5")
 
     main_frame = tk.Frame(win, bg="#f5f5f5")
@@ -569,8 +709,8 @@ def open_tasks():
                 delete_email_db(email_dict["id"])
                 card.destroy()
 
-            tk.Button(btns_row, text="Edit", width=5, bg="#2196F3", fg="white", command=edit_email_action).pack(side="left", padx=2)
-            tk.Button(btns_row, text="Delete", width=6, bg="#f44336", fg="white", command=delete_email_action).pack(side="left", padx=2)
+            make_button(btns_row, text="Edit", width=5, bg="#2196F3", fg="white", command=edit_email_action).pack(side="left", padx=2)
+            make_button(btns_row, text="Delete", width=6, bg="#f44336", fg="white", command=delete_email_action).pack(side="left", padx=2)
 
             if email_dict["expanded"]:
                 tk.Label(card, text=f"Από: {email_dict['sender']}", font=("Arial", 9), bg="#cfe8ff", anchor="w").pack(fill="x", pady=(4, 2))
@@ -598,7 +738,7 @@ def open_tasks():
     def open_new_email_form():
         form = tk.Toplevel(win)
         form.title("Νέο Email")
-        form.geometry("380x320")
+        center_window(form, 380, 340)
         form.configure(bg="#f5f5f5")
         form.grab_set()
 
@@ -637,10 +777,10 @@ def open_tasks():
         btn_frame = tk.Frame(form, bg="#f5f5f5")
         btn_frame.pack(pady=15)
 
-        tk.Button(btn_frame, text="Add", bg="#4CAF50", fg="white", width=10, command=submit_email).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="Cancel", bg="#f44336", fg="white", width=10, command=form.destroy).pack(side="left", padx=5)
+        make_button(btn_frame, text="Add", bg="#4CAF50", fg="white", width=10, command=submit_email).pack(side="left", padx=5)
+        make_button(btn_frame, text="Cancel", bg="#f44336", fg="white", width=10, command=form.destroy).pack(side="left", padx=5)
 
-    tk.Button(new_email_btn_frame, text="+ Νέο Email", bg="#4CAF50", fg="white", command=open_new_email_form).pack()
+    make_button(new_email_btn_frame, text="+ Νέο Email", bg="#4CAF50", fg="white", command=open_new_email_form).pack()
 
     for existing_email in get_all_emails():
         render_email_card(existing_email)
@@ -700,8 +840,8 @@ def open_tasks():
                 delete_task_db(task_dict["id"])
                 row_outer.destroy()
 
-            tk.Button(top_row, text="Edit", width=5, bg="#2196F3", fg="white", command=edit_task_action).pack(side="left", padx=2)
-            tk.Button(top_row, text="Delete", width=6, bg="#f44336", fg="white", command=delete_task_action).pack(side="left", padx=2)
+            make_button(top_row, text="Edit", width=5, bg="#2196F3", fg="white", command=edit_task_action).pack(side="left", padx=2)
+            make_button(top_row, text="Delete", width=6, bg="#f44336", fg="white", command=delete_task_action).pack(side="left", padx=2)
 
             bottom_row = tk.Frame(row_outer, bg="#ffffff")
             bottom_row.pack(fill="x", pady=(2, 0))
@@ -727,7 +867,7 @@ def open_tasks():
         add_task_row(text)
         task_entry.delete(0, tk.END)
 
-    tk.Button(entry_frame, text="Add Task", bg="#4CAF50", fg="white", command=add_task_action).pack(side="left")
+    make_button(entry_frame, text="Add Task", bg="#4CAF50", fg="white", command=add_task_action).pack(side="left")
     task_entry.bind("<Return>", add_task_action)
 
     for existing_task in get_all_tasks():
@@ -738,34 +878,34 @@ def open_tasks():
 def open_members():
     win = tk.Toplevel(root)
     win.title("Members")
-    win.geometry("850x600")
+    center_window(win, 850, 600)
     win.configure(bg="#f5f5f5")
 
-    form_frame = tk.LabelFrame(win, text="New Employee", font=("Arial", 12, "bold"), bg="#f5f5f5", padx=10, pady=10)
-    form_frame.pack(fill="x", padx=10, pady=10)
+    form_frame = tk.LabelFrame(win, text="New Employee", font=("Arial", 12, "bold"), bg="#f5f5f5", padx=14, pady=12)
+    form_frame.pack(fill="x", padx=12, pady=12)
 
-    tk.Label(form_frame, text="Name:", bg="#f5f5f5").grid(row=0, column=0, sticky="w")
+    tk.Label(form_frame, text="Name:", bg="#f5f5f5").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=6)
     first_name_entry = tk.Entry(form_frame, width=20)
-    first_name_entry.grid(row=0, column=1, padx=5, pady=5)
+    first_name_entry.grid(row=0, column=1, padx=(0, 20), pady=6)
 
-    tk.Label(form_frame, text="Surname:", bg="#f5f5f5").grid(row=0, column=2, sticky="w")
+    tk.Label(form_frame, text="Surname:", bg="#f5f5f5").grid(row=0, column=2, sticky="w", padx=(0, 4), pady=6)
     last_name_entry = tk.Entry(form_frame, width=20)
-    last_name_entry.grid(row=0, column=3, padx=5, pady=5)
+    last_name_entry.grid(row=0, column=3, padx=0, pady=6)
 
-    tk.Label(form_frame, text="Job Title:", bg="#f5f5f5").grid(row=1, column=0, sticky="w")
+    tk.Label(form_frame, text="Job Title:", bg="#f5f5f5").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=6)
     job_title_entry = tk.Entry(form_frame, width=20)
-    job_title_entry.grid(row=1, column=1, padx=5, pady=5)
+    job_title_entry.grid(row=1, column=1, padx=(0, 20), pady=6)
 
     current_date = datetime.now().strftime("%d/%m/%Y")
-    tk.Label(form_frame, text="Date:", bg="#f5f5f5").grid(row=1, column=2, sticky="w")
-    tk.Label(form_frame, text=current_date, bg="#ffffff", relief="sunken", width=18, anchor="w").grid(row=1, column=3, padx=5, pady=5)
+    tk.Label(form_frame, text="Date:", bg="#f5f5f5").grid(row=1, column=2, sticky="w", padx=(0, 4), pady=6)
+    tk.Label(form_frame, text=current_date, bg="#ffffff", relief="sunken", width=18, anchor="w").grid(row=1, column=3, padx=0, pady=6)
 
-    tk.Label(form_frame, text="Note:", bg="#f5f5f5").grid(row=2, column=0, sticky="nw")
+    tk.Label(form_frame, text="Note:", bg="#f5f5f5").grid(row=2, column=0, sticky="nw", padx=(0, 4), pady=6)
     note_text = tk.Text(form_frame, width=50, height=5)
-    note_text.grid(row=2, column=1, columnspan=3, padx=5, pady=5, sticky="w")
+    note_text.grid(row=2, column=1, columnspan=3, padx=0, pady=6, sticky="w")
 
     list_outer = tk.Frame(win, bg="#f5f5f5")
-    list_outer.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+    list_outer.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
     canvas = tk.Canvas(list_outer, bg="#ffffff", highlightthickness=0)
     scrollbar = tk.Scrollbar(list_outer, orient="vertical", command=canvas.yview)
@@ -801,7 +941,7 @@ def open_members():
                 delete_member_db(member_id)
                 refresh_members()
 
-            tk.Button(box, text="Delete", bg="#f44336", fg="white", width=8, command=delete_action).pack(anchor="e", pady=(5, 0))
+            make_button(box, text="Delete", bg="#f44336", fg="white", width=8, command=delete_action).pack(anchor="e", pady=(5, 0))
 
     def add_member_action():
         first_name = first_name_entry.get().strip()
@@ -823,7 +963,7 @@ def open_members():
 
         refresh_members()
 
-    tk.Button(form_frame, text="Add Member", bg="#4CAF50", fg="white", command=add_member_action).grid(row=3, column=3, pady=8, sticky="e")
+    make_button(form_frame, text="Add Member", bg="#4CAF50", fg="white", command=add_member_action).grid(row=3, column=3, pady=8, sticky="e")
 
     refresh_members()
 
@@ -832,7 +972,7 @@ def open_members():
 def open_meetings():
     win = tk.Toplevel(root)
     win.title("Meetings")
-    win.geometry("900x600")
+    center_window(win, 900, 600)
     win.configure(bg="#f5f5f5")
 
     left = tk.Frame(win, bg="#f5f5f5", width=260)
@@ -913,7 +1053,7 @@ def open_meetings():
                 delete_meeting_db(meeting_id)
                 refresh_meetings_for_date(current_date)
 
-            tk.Button(box, text="Delete", bg="#f44336", fg="white", width=8, command=delete_action).pack(anchor="e", pady=(5, 0))
+            make_button(box, text="Delete", bg="#f44336", fg="white", width=8, command=delete_action).pack(anchor="e", pady=(5, 0))
 
     def add_meeting_action():
         meeting_date = date_entry.get().strip()
@@ -945,8 +1085,8 @@ def open_meetings():
         selected_date = filter_entry.get().strip()
         refresh_meetings_for_date(selected_date)
 
-    tk.Button(left, text="Add Meeting", bg="#4CAF50", fg="white", width=16, command=add_meeting_action).pack(anchor="w", pady=8)
-    tk.Button(top_filter, text="View", bg="#2196F3", fg="white", width=10, command=view_selected_date).pack(side="left")
+    make_button(left, text="Add Meeting", bg="#4CAF50", fg="white", width=16, command=add_meeting_action).pack(anchor="w", pady=8)
+    make_button(top_filter, text="View", bg="#2196F3", fg="white", width=10, command=view_selected_date).pack(side="left")
 
     filter_entry.bind("<Return>", lambda e: view_selected_date())
 
@@ -957,7 +1097,7 @@ def open_meetings():
 def open_stocklist():
     win = tk.Toplevel(root)
     win.title("Stocklist")
-    win.geometry("1100x700")
+    center_window(win, 1100, 700)
     win.configure(bg="#f5f5f5")
 
     selected_file = {"path": None}
@@ -1247,9 +1387,9 @@ def open_stocklist():
     btn_row = tk.Frame(top_frame, bg="#f5f5f5")
     btn_row.pack(fill="x", pady=(8, 0))
 
-    tk.Button(btn_row, text="Choose Excel", bg="#2196F3", fg="white", width=14, command=choose_excel_file).pack(side="left", padx=(0, 8))
-    tk.Button(btn_row, text="Import to Stocklist", bg="#4CAF50", fg="white", width=16, command=import_selected_sheet).pack(side="left", padx=(0, 8))
-    tk.Button(btn_row, text="Refresh Stats", bg="#FF9800", fg="white", width=12, command=refresh_stats_view).pack(side="left")
+    make_button(btn_row, text="Choose Excel", bg="#2196F3", fg="white", width=14, command=choose_excel_file).pack(side="left", padx=(0, 8))
+    make_button(btn_row, text="Import to Stocklist", bg="#4CAF50", fg="white", width=16, command=import_selected_sheet).pack(side="left", padx=(0, 8))
+    make_button(btn_row, text="Refresh Stats", bg="#FF9800", fg="white", width=12, command=refresh_stats_view).pack(side="left")
 
     sheet_var.trace_add("write", on_sheet_change)
 
@@ -1260,27 +1400,42 @@ def open_stocklist():
 def open_suppliers():
     win = tk.Toplevel(root)
     win.title("Suppliers")
-    win.geometry("980x700")
+    center_window(win, 980, 700)
     win.configure(bg="#f5f5f5")
 
     supplier_map = {}
 
-    form_frame = tk.LabelFrame(win, text="Add Supplier", font=("Arial", 12, "bold"), bg="#f5f5f5", padx=10, pady=10)
-    form_frame.pack(fill="x", padx=10, pady=10)
+    form_frame = tk.LabelFrame(win, text="Add Supplier", font=("Arial", 12, "bold"), bg="#f5f5f5", padx=14, pady=12)
+    form_frame.pack(fill="x", padx=12, pady=12)
 
-    tk.Label(form_frame, text="Name:", bg="#f5f5f5").grid(row=0, column=0, sticky="w")
+    tk.Label(form_frame, text="Name:", bg="#f5f5f5").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=6)
     name_entry = tk.Entry(form_frame, width=22)
-    name_entry.grid(row=0, column=1, padx=5, pady=3)
+    name_entry.grid(row=0, column=1, padx=(0, 16), pady=6)
 
-    tk.Label(form_frame, text="Tel:", bg="#f5f5f5").grid(row=0, column=2, sticky="w")
+    tk.Label(form_frame, text="Tel:", bg="#f5f5f5").grid(row=0, column=2, sticky="w", padx=(0, 4), pady=6)
     tel_entry = tk.Entry(form_frame, width=16)
-    tel_entry.grid(row=0, column=3, padx=5, pady=3)
+    tel_entry.grid(row=0, column=3, padx=(0, 16), pady=6)
 
-    tk.Label(form_frame, text="Contact:", bg="#f5f5f5").grid(row=0, column=4, sticky="w")
+    tk.Label(form_frame, text="Contract:", bg="#f5f5f5").grid(row=0, column=4, sticky="w", padx=(0, 4), pady=6)
     contact_entry = tk.Entry(form_frame, width=18)
-    contact_entry.grid(row=0, column=5, padx=5, pady=3)
+    contact_entry.grid(row=0, column=5, padx=0, pady=6)
 
-    tk.Label(win, text="Suppliers", font=("Arial", 13, "bold"), bg="#f5f5f5").pack(anchor="w", padx=12)
+    suppliers_header = tk.Frame(win, bg="#f5f5f5")
+    suppliers_header.pack(fill="x", padx=14, pady=(4, 0))
+
+    tk.Label(suppliers_header, text="Suppliers", font=("Arial", 13, "bold"), bg="#f5f5f5").pack(side="left")
+
+    tk.Label(suppliers_header, text="Sort by:", bg="#f5f5f5", font=("Arial", 10)).pack(side="left", padx=(20, 4))
+    supplier_sort_var = tk.StringVar(value="Date registered")
+    supplier_sort_menu = tk.OptionMenu(
+        suppliers_header, supplier_sort_var, "Date registered", "Name (A-Z)",
+        command=lambda *_: refresh_all()
+    )
+    supplier_sort_menu.config(width=16)
+    supplier_sort_menu.pack(side="left")
+
+    def current_sort_key():
+        return "name" if supplier_sort_var.get() == "Name (A-Z)" else "date"
 
     suppliers_outer = tk.Frame(win, bg="#f5f5f5", height=230)
     suppliers_outer.pack(fill="x", padx=10, pady=(0, 10))
@@ -1370,8 +1525,8 @@ def open_suppliers():
             else:
                 messagebox.showinfo(label, "Δεν έχει επισυναφθεί αρχείο ακόμα.")
 
-        tk.Button(cell, text="Browse", width=6, bg="#607d8b", fg="white", command=browse).pack(side="left", padx=1)
-        tk.Button(cell, text="Open", width=5, bg="#795548", fg="white", command=open_attachment).pack(side="left", padx=1)
+        make_button(cell, text="Browse", width=6, bg="#607d8b", fg="white", command=browse).pack(side="left", padx=1)
+        make_button(cell, text="Open", width=5, bg="#795548", fg="white", command=open_attachment).pack(side="left", padx=1)
 
     def add_supplier_row(supplier):
         row_outer = tk.Frame(suppliers_container, bg="#ffffff", relief="groove", borderwidth=1, pady=6, padx=6)
@@ -1382,16 +1537,27 @@ def open_suppliers():
 
         tk.Label(info_row, text=supplier["name"], font=("Arial", 11, "bold"), bg="#ffffff", anchor="w", width=20).pack(side="left")
         tk.Label(info_row, text=f"Tel: {supplier['tel'] or '-'}", font=("Arial", 10), bg="#ffffff", anchor="w", width=18).pack(side="left")
-        tk.Label(info_row, text=f"Contact: {supplier['contact'] or '-'}", font=("Arial", 10), bg="#ffffff", anchor="w", width=22).pack(side="left")
+        tk.Label(info_row, text=f"Contract: {supplier['contact'] or '-'}", font=("Arial", 10), bg="#ffffff", anchor="w", width=22).pack(side="left")
 
         def edit_supplier_action():
             new_name = simpledialog.askstring("Edit Supplier", "Name:", initialvalue=supplier["name"])
-            new_tel = simpledialog.askstring("Edit Supplier", "Tel:", initialvalue=supplier["tel"])
-            new_contact = simpledialog.askstring("Edit Supplier", "Contact:", initialvalue=supplier["contact"])
+            if new_name is None:
+                return
+            new_name = new_name.strip()
 
-            if new_name:
-                update_supplier_db(supplier["id"], new_name, new_tel or "", new_contact or "")
-                refresh_all()
+            new_tel = simpledialog.askstring("Edit Supplier", "Tel:", initialvalue=supplier["tel"])
+            new_tel = (new_tel or "").strip()
+
+            new_contact = simpledialog.askstring("Edit Supplier", "Contract:", initialvalue=supplier["contact"])
+            new_contact = (new_contact or "").strip()
+
+            error = validate_supplier_fields(new_name, new_tel, new_contact)
+            if error:
+                messagebox.showwarning("Προσοχή", error)
+                return
+
+            update_supplier_db(supplier["id"], new_name, new_tel, new_contact)
+            refresh_all()
 
         def delete_supplier_action():
             if not messagebox.askyesno("Delete", f"Διαγραφή προμηθευτή '{supplier['name']}';"):
@@ -1399,8 +1565,8 @@ def open_suppliers():
             delete_supplier_db(supplier["id"])
             refresh_all()
 
-        tk.Button(info_row, text="Edit", width=5, bg="#2196F3", fg="white", command=edit_supplier_action).pack(side="left", padx=2)
-        tk.Button(info_row, text="Delete", width=6, bg="#f44336", fg="white", command=delete_supplier_action).pack(side="left", padx=2)
+        make_button(info_row, text="Edit", width=5, bg="#2196F3", fg="white", command=edit_supplier_action).pack(side="left", padx=2)
+        make_button(info_row, text="Delete", width=6, bg="#f44336", fg="white", command=delete_supplier_action).pack(side="left", padx=2)
 
         attach_row = tk.Frame(row_outer, bg="#ffffff")
         attach_row.pack(fill="x", pady=(4, 0))
@@ -1425,7 +1591,7 @@ def open_suppliers():
             delete_supplier_item_db(item["id"])
             refresh_all()
 
-        tk.Button(row, text="Delete", width=6, bg="#f44336", fg="white", command=delete_item_action).pack(side="left", padx=4)
+        make_button(row, text="Delete", width=6, bg="#f44336", fg="white", command=delete_item_action).pack(side="left", padx=4)
 
     def update_summary(supplier):
         if not supplier or not supplier["items"]:
@@ -1451,7 +1617,7 @@ def open_suppliers():
         menu.delete(0, "end")
         supplier_map.clear()
 
-        suppliers = get_all_suppliers()
+        suppliers = get_all_suppliers(order_by=current_sort_key())
         names = []
 
         for s in suppliers:
@@ -1490,7 +1656,7 @@ def open_suppliers():
         for widget in suppliers_container.winfo_children():
             widget.destroy()
 
-        for supplier in get_all_suppliers():
+        for supplier in get_all_suppliers(order_by=current_sort_key()):
             add_supplier_row(supplier)
 
         refresh_supplier_menu()
@@ -1501,8 +1667,9 @@ def open_suppliers():
         tel = tel_entry.get().strip()
         contact = contact_entry.get().strip()
 
-        if not name:
-            messagebox.showwarning("Προσοχή", "Το πεδίο Name είναι υποχρεωτικό.")
+        error = validate_supplier_fields(name, tel, contact)
+        if error:
+            messagebox.showwarning("Προσοχή", error)
             return
 
         add_supplier_db(name, tel, contact)
@@ -1539,8 +1706,8 @@ def open_suppliers():
         price_entry.delete(0, tk.END)
         refresh_all()
 
-    tk.Button(form_frame, text="Add Supplier", bg="#4CAF50", fg="white", command=add_supplier_action).grid(row=0, column=6, padx=10)
-    tk.Button(control_row, text="Add Quote Item", bg="#4CAF50", fg="white", command=add_item_action).pack(side="left")
+    make_button(form_frame, text="Add Supplier", bg="#4CAF50", fg="white", command=add_supplier_action).grid(row=0, column=6, padx=10)
+    make_button(control_row, text="Add Quote Item", bg="#4CAF50", fg="white", command=add_item_action).pack(side="left")
 
     selected_supplier.trace_add("write", lambda *args: refresh_items_view())
 
@@ -1552,22 +1719,29 @@ init_db()
 
 root = tk.Tk()
 root.title("Dashboard MSC")
-root.geometry("560x380")
+center_window(root, 620, 480)
 root.configure(bg="#f5f5f5")
 
-header = tk.Label(root, text="Dashboard MSC", font=("Arial", 18, "bold"), bg="#f5f5f5", fg="#222")
-header.pack(pady=(25, 20))
+header = tk.Label(root, text="Dashboard MSC", font=("Arial", 22, "bold"), bg="#f5f5f5", fg="#222")
+header.pack(pady=(30, 4))
+
+subtitle = tk.Label(root, text="Tasks · Suppliers · Members · Meetings · Stocklist",
+                     font=("Arial", 10, "italic"), bg="#f5f5f5", fg="#777")
+subtitle.pack(pady=(0, 4))
+
+divider = tk.Frame(root, bg="#dddddd", height=1)
+divider.pack(fill="x", padx=60, pady=(10, 25))
 
 btn_frame = tk.Frame(root, bg="#f5f5f5")
-btn_frame.pack(pady=10)
+btn_frame.pack(pady=5)
 
-tk.Button(btn_frame, text="Tasks", width=18, height=2, bg="#2196F3", fg="white", command=open_tasks).grid(row=0, column=0, padx=10, pady=8)
-tk.Button(btn_frame, text="Suppliers", width=18, height=2, bg="#FF9800", fg="white", command=open_suppliers).grid(row=0, column=1, padx=10, pady=8)
-tk.Button(btn_frame, text="Members", width=18, height=2, bg="#4CAF50", fg="white", command=open_members).grid(row=1, column=0, padx=10, pady=8)
-tk.Button(btn_frame, text="Meetings", width=18, height=2, bg="#9C27B0", fg="white", command=open_meetings).grid(row=1, column=1, padx=10, pady=8)
-tk.Button(btn_frame, text="Stocklist", width=18, height=2, bg="#795548", fg="white", command=open_stocklist).grid(row=2, column=0, columnspan=2, padx=10, pady=8)
+make_button(btn_frame, text="Tasks", width=18, height=2, bg="#2196F3", fg="white", command=open_tasks).grid(row=0, column=0, padx=14, pady=10)
+make_button(btn_frame, text="Suppliers", width=18, height=2, bg="#FF9800", fg="white", command=open_suppliers).grid(row=0, column=1, padx=14, pady=10)
+make_button(btn_frame, text="Members", width=18, height=2, bg="#4CAF50", fg="white", command=open_members).grid(row=1, column=0, padx=14, pady=10)
+make_button(btn_frame, text="Meetings", width=18, height=2, bg="#9C27B0", fg="white", command=open_meetings).grid(row=1, column=1, padx=14, pady=10)
+make_button(btn_frame, text="Stocklist", width=18, height=2, bg="#795548", fg="white", command=open_stocklist).grid(row=2, column=0, columnspan=2, padx=14, pady=10)
 
 footer = tk.Label(root, text="Local SQLite storage enabled", font=("Arial", 10, "italic"), bg="#f5f5f5", fg="#666")
-footer.pack(pady=(15, 0))
+footer.pack(pady=(20, 0))
 
-root.mainloop().\.venv\Scripts\python.exe dashboard.py
+root.mainloop()
