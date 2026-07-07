@@ -1,2 +1,2 @@
-# Dashboard-Intern-Company
+# dashboard
 MSC Dashboard
