@@ -4,7 +4,7 @@ An internal desktop dashboard built for MSC, put together after the company's CO
 
 ## Why it exists
 
-Day-to-day office work tends to live in too many places at once — supplier quotes buried in email, meeting notes on paper, stock prices in a dozen different spreadsheet versions. The idea behind this dashboard is to pull the essentials into one lightweight tool that anyone on the team can open and use without training: track tasks straight from incoming emails, keep supplier contacts and price quotes in one place, log team members and meetings, and import/compare stock pricing — all backed by a local database so nothing depends on a shared server or someone's personal spreadsheet copy.
+Day-to-day office work tends to live in too many places at once supplier quotes buried in email, meeting notes on paper, stock prices in a dozen different spreadsheet versions. The idea behind this dashboard is to pull the essentials into one lightweight tool that anyone on the team can open and use without training: track tasks straight from incoming emails, keep supplier contacts and price quotes in one place, log team members and meetings, and import/compare stock pricing all backed by a local database so nothing depends on a shared server or someone's personal spreadsheet copy.
 
 It's intentionally simple by design: a native desktop app, no login, no cloud dependency, built to be extended as the team's needs grow.
 
@@ -18,7 +18,7 @@ It's intentionally simple by design: a native desktop app, no login, no cloud de
 
 ## Requirements
 
-- Python 3.14 or later, with a Tk 9.x build (older Tk versions, especially on macOS, have known rendering bugs — buttons/entries can render blank or with wrong colors)
+- Python 3.14 or later, with a Tk 9.x build (older Tk versions, especially on macOS, have known rendering bugs buttons/entries can render blank or with wrong colors)
 - `pandas` (for the Stocklist Excel import): `pip install pandas`
 
 ## Running it
