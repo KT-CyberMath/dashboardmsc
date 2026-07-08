@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import shutil
 import sqlite3
 import subprocess
 import tkinter as tk
@@ -22,8 +23,39 @@ ATTACHMENT_FILETYPES = [
     ("All files", "*.*"),
 ]
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# The database used to live next to the script (BASE_DIR = the .py file's
+# folder). That breaks once this gets packaged into a standalone app with
+# PyInstaller: a packaged .app/.exe unpacks to a temporary folder on every
+# launch, so "next to the script" would be a different, throwaway location
+# each time — meaning every launch would look like a fresh install with no
+# saved data. Store the database in a stable, per-user app-data folder
+# instead, which works identically whether this runs as a plain .py file or
+# as a packaged app.
+def get_app_data_dir():
+    if sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    elif sys.platform.startswith("win"):
+        base = os.getenv("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.path.expanduser("~/.local/share")
+
+    app_dir = os.path.join(base, "DashboardMSC")
+    os.makedirs(app_dir, exist_ok=True)
+    return app_dir
+
+
+BASE_DIR = get_app_data_dir()
 DB_FILE = os.path.join(BASE_DIR, "dashboard.db")
+
+# One-time migration: if there's an old dashboard.db sitting next to the
+# script from before this change, and no database in the new location yet,
+# copy the old one over so existing data isn't lost.
+_LEGACY_DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.db")
+if not os.path.exists(DB_FILE) and os.path.exists(_LEGACY_DB_FILE):
+    try:
+        shutil.copy2(_LEGACY_DB_FILE, DB_FILE)
+    except OSError:
+        pass
 
 # ================= SUPPLIER FIELD VALIDATION =================
 # Name: letters (Greek or Latin) and numbers only (plus spaces).
@@ -627,12 +659,38 @@ def center_window(win, width, height):
     win.minsize(width, height)
 
 
+def go_back_to_dashboard(win):
+    """Close a section window and bring the main dashboard menu back."""
+    win.destroy()
+    root.deiconify()
+
+
+def open_section_window(title, width, height):
+    """Create a section window (Tasks/Suppliers/Members/Meetings/Stocklist):
+    hides the main dashboard menu while it's open, and adds a "Back to
+    Dashboard" bar at the top so the user can return without hunting for
+    the window controls. Closing the window (the OS close button) does the
+    same thing as clicking Back, so there's no way to strand the user with
+    neither window visible."""
+    win = tk.Toplevel(root)
+    win.title(title)
+    center_window(win, width, height)
+    win.configure(bg="#f5f5f5")
+
+    root.withdraw()
+    win.protocol("WM_DELETE_WINDOW", lambda: go_back_to_dashboard(win))
+
+    back_bar = tk.Frame(win, bg="#f5f5f5")
+    back_bar.pack(fill="x", padx=10, pady=(10, 0))
+    make_button(back_bar, text="← Back to Dashboard", bg="#607d8b", fg="white",
+                command=lambda: go_back_to_dashboard(win)).pack(side="left")
+
+    return win
+
+
 # ================= TASKS WINDOW =================
 def open_tasks():
-    win = tk.Toplevel(root)
-    win.title("Tasks")
-    center_window(win, 850, 550)
-    win.configure(bg="#f5f5f5")
+    win = open_section_window("Tasks", 850, 550)
 
     main_frame = tk.Frame(win, bg="#f5f5f5")
     main_frame.pack(fill="both", expand=True)
@@ -908,10 +966,7 @@ def open_tasks():
 
 # ================= MEMBERS WINDOW =================
 def open_members():
-    win = tk.Toplevel(root)
-    win.title("Members")
-    center_window(win, 850, 600)
-    win.configure(bg="#f5f5f5")
+    win = open_section_window("Members", 850, 600)
 
     form_frame = tk.LabelFrame(win, text="New Employee", font=("Arial", 12, "bold"), bg="#f5f5f5", padx=14, pady=12)
     form_frame.pack(fill="x", padx=12, pady=12)
@@ -1002,10 +1057,7 @@ def open_members():
 
 # ================= MEETINGS WINDOW =================
 def open_meetings():
-    win = tk.Toplevel(root)
-    win.title("Meetings")
-    win.geometry("900x600")
-    win.configure(bg="#f5f5f5")
+    win = open_section_window("Meetings", 900, 600)
 
     left = tk.Frame(win, bg="#f5f5f5", width=260)
     left.pack(side="left", fill="y", padx=10, pady=10)
@@ -1187,10 +1239,7 @@ def open_meetings():
 
 # ================= STOCKLIST WINDOW =================
 def open_stocklist():
-    win = tk.Toplevel(root)
-    win.title("Stocklist")
-    center_window(win, 1100, 700)
-    win.configure(bg="#f5f5f5")
+    win = open_section_window("Stocklist", 1100, 700)
 
     selected_file = {"path": None}
     excel_data = {"sheets": {}}
@@ -1537,10 +1586,7 @@ def open_stocklist():
 
 # ================= SUPPLIERS WINDOW =================
 def open_suppliers():
-    win = tk.Toplevel(root)
-    win.title("Suppliers")
-    center_window(win, 980, 700)
-    win.configure(bg="#f5f5f5")
+    win = open_section_window("Suppliers", 980, 700)
 
     supplier_map = {}
 
