@@ -1201,60 +1201,6 @@ def open_assignee_picker(parent, current_ids, on_confirm):
     make_button(btn_row, text="Cancel", bg="#A32D2D", fg="white", command=dialog.destroy).pack(side="left", padx=(6, 0))
 
 
-def open_column_picker(parent, prompt, choices, current_selection, on_confirm):
-    """Generic checkbox popup for picking any number of items from a list
-    of plain strings (spreadsheet column names, in this case). Same
-    pattern as open_assignee_picker, just not tied to members specifically.
-    Calls on_confirm(list_of_selected_strings) if OK is clicked."""
-    dialog = tk.Toplevel(parent)
-    dialog.title("Select columns")
-    dialog.configure(bg="#EEF2F7")
-    dialog.grab_set()
-    center_window(dialog, 340, 420)
-
-    tk.Label(dialog, text=prompt, font=FONTS["f11b"], bg="#EEF2F7", wraplength=300, justify="left").pack(anchor="w", padx=12, pady=(12, 6))
-
-    list_outer = tk.Frame(dialog, bg="#ffffff")
-    list_outer.pack(fill="both", expand=True, padx=12)
-
-    canvas = tk.Canvas(list_outer, bg="#ffffff", highlightthickness=0)
-    scrollbar = tk.Scrollbar(list_outer, orient="vertical", command=canvas.yview)
-    inner = tk.Frame(canvas, bg="#ffffff")
-
-    inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-    window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-    canvas.configure(yscrollcommand=scrollbar.set)
-    bind_canvas_stretch(canvas, window_id)
-    bind_mousewheel_scroll(canvas)
-
-    canvas.pack(side="left", fill="both", expand=True)
-    scrollbar.pack(side="right", fill="y")
-
-    current_selection = set(current_selection)
-    vars_by_choice = {}
-
-    if not choices:
-        tk.Label(inner, text="Δεν υπάρχουν διαθέσιμες στήλες.", bg="#ffffff", fg="#5B7A99", font=FONTS["f9i"]).pack(anchor="w", padx=6, pady=6)
-    else:
-        for choice in choices:
-            var = tk.BooleanVar(value=choice in current_selection)
-            vars_by_choice[choice] = var
-            tk.Checkbutton(
-                inner, text=choice, variable=var,
-                bg="#ffffff", anchor="w", font=FONTS["f10"]
-            ).pack(fill="x", padx=6, pady=2)
-
-    def confirm():
-        selected = [choice for choice, var in vars_by_choice.items() if var.get()]
-        on_confirm(selected)
-        dialog.destroy()
-
-    btn_row = tk.Frame(dialog, bg="#EEF2F7")
-    btn_row.pack(fill="x", padx=12, pady=10)
-    make_button(btn_row, text="OK", bg="#639922", fg="white", command=confirm).pack(side="left")
-    make_button(btn_row, text="Cancel", bg="#A32D2D", fg="white", command=dialog.destroy).pack(side="left", padx=(6, 0))
-
-
 # Entry/Text fields elsewhere in this file are created with no explicit
 # colors (e.g. tk.Entry(form_frame, width=22)). On some macOS + Tk 9.x
 # setups, unstyled Entry/Text widgets pick up the system Dark Mode default
@@ -2573,7 +2519,12 @@ def open_stocklist():
             "name",
             "description",
             "product",
-            "product name"
+            "product name",
+            "group form title",
+            "groupformtitle",
+            "order form title",
+            "orderformtitle",
+            "form title"
         ]
 
         detected_group = ""
@@ -2602,24 +2553,6 @@ def open_stocklist():
             detected_price = columns[1]
 
         return detected_group, detected_price, detected_name
-
-    # Columns whose value should be auto-suggested for exclusion from
-    # Price — delivery/packaging/handling are routinely bundled into a
-    # "total" price in supplier spreadsheets, but they're not part of the
-    # item's own cost. This is a starting suggestion the user can still
-    # adjust via "Choose columns…"; it doesn't lock anything in.
-    EXCLUDE_KEYWORDS = [
-        "delivery", "shipping", "transport", "transportation", "freight",
-        "packaging", "packing", "handling",
-    ]
-
-    def detect_exclude_columns(columns):
-        detected = []
-        for col in columns:
-            col_lower = col.lower()
-            if any(keyword in col_lower for keyword in EXCLUDE_KEYWORDS):
-                detected.append(col)
-        return detected
 
     row2 = tk.Frame(top_frame, bg="#EEF2F7")
     row2.pack(fill="x", pady=4)
@@ -2672,53 +2605,6 @@ def open_stocklist():
     name_menu = tk.OptionMenu(row2, name_var, "")
     name_menu.config(width=22)
     name_menu.pack(side="left", padx=(4, 0))
-
-    row3 = tk.Frame(top_frame, bg="#EEF2F7")
-    row3.pack(fill="x", pady=4)
-
-    # Some source spreadsheets bake extra costs (e.g. transportation) into
-    # the same price cell as the actual item cost. Rather than assume the
-    # Price column is already "clean," let the user pick any number of
-    # other columns whose value should be subtracted from Price before it's
-    # stored — so what shows up in the dashboard is just the item's own
-    # cost, not item + shipping + whatever else.
-    exclude_state = {"selected": []}
-
-    tk.Label(row3, text="Exclude from price:", bg="#EEF2F7").pack(side="left")
-    exclude_summary_lbl = tk.Label(row3, text="(none)", bg="#EEF2F7", fg="#5B7A99", font=FONTS["f9i"])
-    exclude_summary_lbl.pack(side="left", padx=(4, 8))
-
-    def refresh_exclude_summary():
-        if exclude_state["selected"]:
-            exclude_summary_lbl.config(text=", ".join(exclude_state["selected"]), fg="#0F2A4A")
-        else:
-            exclude_summary_lbl.config(text="(none)", fg="#5B7A99")
-
-    def pick_exclude_columns():
-        current_sheet = sheet_var.get().strip()
-        if not current_sheet or current_sheet not in excel_data["sheets"]:
-            messagebox.showwarning("Warning", "Διάλεξε πρώτα ένα Excel αρχείο και sheet.")
-            return
-
-        df = excel_data["sheets"][current_sheet]
-        all_cols = [str(c).strip() for c in df.columns.tolist()]
-        # Excluding the columns already used as Group/Price/Name wouldn't
-        # make sense (you can't subtract the price from itself), so leave
-        # those out of the picker.
-        used = {group_var.get().strip(), price_var.get().strip(), name_var.get().strip()}
-        choices = [c for c in all_cols if c not in used]
-
-        if not choices:
-            messagebox.showinfo("Exclude from price", "Δεν υπάρχουν άλλες στήλες σε αυτό το sheet.")
-            return
-
-        def on_confirm(selected):
-            exclude_state["selected"] = selected
-            refresh_exclude_summary()
-
-        open_column_picker(win, "Select cost columns to subtract from Price", choices, exclude_state["selected"], on_confirm)
-
-    make_button(row3, text="Choose columns…", bg="#5B7A99", fg="white", command=pick_exclude_columns).pack(side="left")
 
     info_label = tk.Label(top_frame, text="Total imported rows: 0", bg="#EEF2F7", fg="#0F2A4A", font=FONTS["f10b"])
     info_label.pack(anchor="w", pady=(8, 2))
@@ -3007,15 +2893,6 @@ def open_stocklist():
         if detected_name in cols or detected_name == "":
             name_var.set(detected_name)
 
-        # Column names can differ sheet to sheet, so a previously chosen
-        # exclude-list might not even exist here — start fresh each time,
-        # but auto-suggest any delivery/packaging/handling-looking columns
-        # right away rather than making the user find them manually via
-        # "Choose columns…" every single import.
-        used = {group_var.get().strip(), price_var.get().strip(), name_var.get().strip()}
-        exclude_state["selected"] = [c for c in detect_exclude_columns(cols) if c not in used]
-        refresh_exclude_summary()
-
         info_label.config(text=f"Loaded sheet rows: {len(df)}")
 
     def choose_excel_file():
@@ -3117,23 +2994,6 @@ def open_stocklist():
 
         df[price_col] = df[price_col].apply(clean_price_to_float)
 
-        # Subtract any chosen "exclude from price" columns (e.g.
-        # transportation cost) from the raw price, so what gets stored is
-        # just the item's own cost. Rows missing a value in one of those
-        # columns are treated as 0 for that column (nothing to subtract),
-        # not as "invalid" — a blank transportation cell just means no
-        # transportation cost was recorded for that row.
-        excluded_cols_present = [c for c in exclude_state["selected"] if c in df.columns]
-        negative_after_exclude = 0
-        if excluded_cols_present:
-            total_excluded = pd.Series(0.0, index=df.index)
-            for col in excluded_cols_present:
-                total_excluded = total_excluded + df[col].apply(clean_price_to_float).fillna(0.0)
-
-            adjusted_price = df[price_col] - total_excluded
-            negative_after_exclude = int((adjusted_price < 0).sum())
-            df[price_col] = adjusted_price.clip(lower=0)
-
         if name_col and name_col in df.columns:
             df[name_col] = (
                 df[name_col]
@@ -3189,14 +3049,6 @@ def open_stocklist():
         new_supplier_entry.delete(0, tk.END)
 
         success_msg = f"Έγινε import {len(rows)} γραμμών από το sheet '{current_sheet}' για τον supplier '{supplier_name}'."
-        if excluded_cols_present:
-            success_msg += f"\n\nΑφαιρέθηκαν από την τιμή: {', '.join(excluded_cols_present)}."
-        if negative_after_exclude:
-            success_msg += (
-                f"\n\n{negative_after_exclude} γραμμή/ές είχαν εξαιρούμενο κόστος μεγαλύτερο "
-                "από την αρχική τιμή και παραλείφθηκαν (τελική τιμή θα ήταν 0 ή αρνητική)."
-            )
-
         messagebox.showinfo("Success", success_msg)
 
     btn_row = tk.Frame(top_frame, bg="#EEF2F7")
