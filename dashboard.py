@@ -855,6 +855,32 @@ def get_suppliers_with_stock_db():
     return rows
 
 
+def get_supplier_comparison_for_group_db(item_group):
+    """For one group, every supplier who has items in it with their own
+    Count/Min/Max/Average price — the second level of the "Group" browse
+    mode (Group -> this supplier price comparison). Sorted cheapest average
+    first, since the whole point is comparing who's cheapest."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            s.id AS supplier_id,
+            s.name AS supplier_name,
+            COUNT(*) AS item_count,
+            MIN(si.price) AS min_price,
+            MAX(si.price) AS max_price,
+            AVG(si.price) AS avg_price
+        FROM stock_items si
+        JOIN suppliers s ON s.id = si.supplier_id
+        WHERE si.item_group = ?
+        GROUP BY s.id, s.name
+        ORDER BY avg_price ASC
+    """, (item_group,))
+    rows = [dict(row) for row in cur.fetchall()]
+    conn.close()
+    return rows
+
+
 def get_stock_items_for_group_db(item_group, supplier_id=None):
     """Individual item rows within one group — the deepest level of the
     "Supplier" drill-down (Supplier -> Group -> these items)."""
@@ -2653,34 +2679,6 @@ def open_stocklist():
         for w in content_frame.winfo_children():
             w.destroy()
 
-    def make_stats_tree(parent):
-        tree_frame = tk.Frame(parent, bg="#ffffff")
-        tree_frame.pack(fill="both", expand=True)
-
-        columns = ("group", "count", "min", "max", "avg")
-        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=14)
-
-        tree.heading("group", text="Group")
-        tree.heading("count", text="Count")
-        tree.heading("min", text="Min Price")
-        tree.heading("max", text="Max Price")
-        tree.heading("avg", text="Avg Price")
-
-        tree.column("group", width=320, anchor="w")
-        tree.column("count", width=100, anchor="center")
-        tree.column("min", width=150, anchor="e")
-        tree.column("max", width=150, anchor="e")
-        tree.column("avg", width=150, anchor="e")
-
-        yscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-        xscroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
-
-        tree.pack(side="left", fill="both", expand=True)
-        yscroll.pack(side="right", fill="y")
-        xscroll.pack(side="bottom", fill="x")
-        return tree
-
     def make_scroll_list(parent):
         outer = tk.Frame(parent, bg="#ffffff")
         outer.pack(fill="both", expand=True)
@@ -2701,23 +2699,66 @@ def open_stocklist():
 
     def render_group_view():
         clear_content()
-        tree = make_stats_tree(content_frame)
 
-        stats = get_stock_group_stats()
-        total_rows = get_stock_overall_count()
+        # nav_state["group"] is shared with the "Supplier" mode's own
+        # drill-down — safe to reuse since set_mode() always resets it to
+        # None the moment you switch modes, so the two never collide.
+        if nav_state["group"] is None:
+            stats = get_stock_group_stats()
+            total_rows = get_stock_overall_count()
 
-        for row in stats:
-            tree.insert(
-                "", "end",
-                values=(
-                    row["item_group"], row["item_count"],
-                    f"{row['min_price']:.2f}", f"{row['max_price']:.2f}", f"{row['avg_price']:.2f}",
+            if not stats:
+                tk.Label(content_frame, text="No stock data loaded.", bg="#ffffff", fg="#5B7A99", font=FONTS["f10i"]).pack(anchor="w", padx=8, pady=8)
+                info_label.config(text=f"Total imported rows: {total_rows}")
+                return
+
+            container = make_scroll_list(content_frame)
+            for row in stats:
+                text = (
+                    f"{row['item_group']}   •   {row['item_count']} items   •   "
+                    f"Min €{row['min_price']:.2f}   Max €{row['max_price']:.2f}   Avg €{row['avg_price']:.2f}"
                 )
-            )
 
-        summary_text = "No stock data loaded." if not stats else f"Groups: {len(stats)} | Total rows: {total_rows}"
-        tk.Label(content_frame, text=summary_text, bg="#ffffff", fg="#5B7A99", font=FONTS["f10i"]).pack(anchor="w", pady=(8, 0))
-        info_label.config(text=f"Total imported rows: {total_rows}")
+                def go(group_name=row["item_group"]):
+                    nav_state["group"] = group_name
+                    render_stocklist_view()
+
+                render_supplier_row(container, text, go)
+
+            tk.Label(content_frame, text=f"Groups: {len(stats)} | Total rows: {total_rows}", bg="#ffffff", fg="#5B7A99", font=FONTS["f10i"]).pack(anchor="w", pady=(8, 0))
+            info_label.config(text=f"Total imported rows: {total_rows}")
+
+        else:
+            back_row = tk.Frame(content_frame, bg="#ffffff")
+            back_row.pack(fill="x", pady=(0, 6))
+
+            def back_to_groups():
+                nav_state["group"] = None
+                render_stocklist_view()
+
+            make_button(back_row, text="← All Groups", bg="#5B7A99", fg="white", command=back_to_groups).pack(side="left")
+            tk.Label(back_row, text=f"  {nav_state['group']}", font=FONTS["f12b"], bg="#ffffff", fg="#0F2A4A").pack(side="left", padx=(8, 0))
+
+            comparison = get_supplier_comparison_for_group_db(nav_state["group"])
+            if not comparison:
+                tk.Label(content_frame, text="Δεν υπάρχουν suppliers για αυτό το group.", bg="#ffffff", fg="#5B7A99", font=FONTS["f10i"]).pack(anchor="w", padx=8, pady=8)
+                return
+
+            tk.Label(
+                content_frame, text="Σύγκριση suppliers για αυτό το group (ταξινομημένα από τον φθηνότερο μέσο όρο):",
+                font=FONTS["f10i"], bg="#ffffff", fg="#5B7A99"
+            ).pack(anchor="w", pady=(0, 6))
+
+            container = make_scroll_list(content_frame)
+            for row in comparison:
+                text = (
+                    f"{row['supplier_name']}   •   {row['item_count']} items   •   "
+                    f"Min €{row['min_price']:.2f}   Max €{row['max_price']:.2f}   Average €{row['avg_price']:.2f}"
+                )
+                box = tk.Frame(container, bg="#EAF0F7", relief="flat", borderwidth=0,
+                                highlightthickness=1, highlightbackground="#C8D4E2", padx=10, pady=8)
+                box.pack(fill="x", padx=4, pady=3)
+                tk.Label(box, text=text, font=FONTS["f10"], bg="#EAF0F7", anchor="w").pack(fill="x")
 
     def render_supplier_row(container, text, command):
         row = tk.Frame(container, bg="#EAF0F7", relief="flat", borderwidth=0,
