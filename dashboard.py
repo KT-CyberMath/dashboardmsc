@@ -593,28 +593,45 @@ def delete_supplier_item_db(item_id):
 
 
 # ================= MEMBERS =================
-def get_all_members(search=""):
+def get_all_members(search="", job_title=None):
     """Alphabetical by first name, then last name. `search` (optional)
-    filters to names containing that text, case-insensitively."""
+    filters to names containing that text, case-insensitively. `job_title`
+    (optional) narrows to an exact job title match, e.g. showing only
+    "Manager" — leave as None to show everyone regardless of role."""
     conn = get_conn()
     cur = conn.cursor()
+
+    conditions = []
+    params = []
+
     if search:
+        conditions.append("(first_name LIKE ? OR last_name LIKE ?)")
         like = f"%{search}%"
-        cur.execute(
-            """
-            SELECT * FROM members
-            WHERE first_name LIKE ? OR last_name LIKE ?
-            ORDER BY first_name COLLATE NOCASE ASC, last_name COLLATE NOCASE ASC
-            """,
-            (like, like)
-        )
-    else:
-        cur.execute(
-            "SELECT * FROM members ORDER BY first_name COLLATE NOCASE ASC, last_name COLLATE NOCASE ASC"
-        )
+        params.extend([like, like])
+
+    if job_title:
+        conditions.append("job_title = ?")
+        params.append(job_title)
+
+    query = "SELECT * FROM members"
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY first_name COLLATE NOCASE ASC, last_name COLLATE NOCASE ASC"
+
+    cur.execute(query, params)
     rows = [dict(row) for row in cur.fetchall()]
     conn.close()
     return rows
+
+
+def get_distinct_job_titles_db():
+    """Every job title currently in use, for the Members filter dropdown."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT job_title FROM members ORDER BY job_title COLLATE NOCASE ASC")
+    titles = [row["job_title"] for row in cur.fetchall() if row["job_title"]]
+    conn.close()
+    return titles
 
 
 def get_member_by_id(member_id):
@@ -1932,6 +1949,24 @@ def open_members():
     search_entry = tk.Entry(search_row, width=22)
     search_entry.pack(side="left")
 
+    tk.Label(search_row, text="Job Title:", bg="#EEF2F7", font=FONTS["f10"]).pack(side="left", padx=(20, 4))
+    job_title_filter_var = tk.StringVar(value="All")
+    job_title_menu = tk.OptionMenu(search_row, job_title_filter_var, "All")
+    job_title_menu.config(width=16)
+    job_title_menu.pack(side="left")
+
+    def refresh_job_title_filter_menu():
+        titles = get_distinct_job_titles_db()
+        current = job_title_filter_var.get()
+        menu = job_title_menu["menu"]
+        menu.delete(0, "end")
+        menu.add_command(label="All", command=lambda: (job_title_filter_var.set("All"), refresh_members()))
+        for title in titles:
+            menu.add_command(label=title, command=lambda t=title: (job_title_filter_var.set(t), refresh_members()))
+        # Keep the current selection if it's still a valid title, otherwise fall back to "All"
+        if current != "All" and current not in titles:
+            job_title_filter_var.set("All")
+
     list_outer = tk.Frame(win, bg="#EEF2F7")
     list_outer.pack(fill="both", expand=True, padx=12, pady=(8, 12))
 
@@ -1949,10 +1984,16 @@ def open_members():
     scrollbar.pack(side="right", fill="y")
 
     def refresh_members():
+        refresh_job_title_filter_menu()
+
         for widget in members_container.winfo_children():
             widget.destroy()
 
-        members = get_all_members(search=search_entry.get().strip())
+        selected_title = job_title_filter_var.get()
+        members = get_all_members(
+            search=search_entry.get().strip(),
+            job_title=None if selected_title == "All" else selected_title,
+        )
 
         if not members:
             tk.Label(members_container, text="Δεν βρέθηκαν εργαζόμενοι.", bg="#ffffff", fg="#5B7A99", font=FONTS["f10"]).pack(anchor="w", padx=8, pady=8)
@@ -2062,19 +2103,32 @@ def open_member_profile_window(member_id, members_win, on_close_refresh):
     name_lbl = tk.Label(name_row, text=f"{member['first_name']} {member['last_name']}", font=FONTS["f22b"], bg="#EEF2F7")
     name_lbl.pack(side="left")
 
-    def edit_name_action():
-        new_first = simpledialog.askstring("Edit Name", "Name:", initialvalue=member["first_name"])
+    job_title_row = tk.Frame(header, bg="#EEF2F7")
+    job_title_row.pack(anchor="w")
+
+    job_title_lbl = tk.Label(job_title_row, text=member["job_title"], font=FONTS["f12b"], bg="#EEF2F7", fg="#5B7A99")
+    job_title_lbl.pack(side="left")
+
+    def edit_profile_action():
+        # One combined edit for Name, Surname, and Job Title together,
+        # rather than a separate Edit button next to each field.
+        new_first = simpledialog.askstring("Edit Employee", "Name:", initialvalue=member["first_name"])
         if new_first is None:
             return
         new_first = to_title_case(new_first)
 
-        new_last = simpledialog.askstring("Edit Name", "Surname:", initialvalue=member["last_name"])
+        new_last = simpledialog.askstring("Edit Employee", "Surname:", initialvalue=member["last_name"])
         if new_last is None:
             return
         new_last = to_title_case(new_last)
 
-        if not new_first or not new_last:
-            messagebox.showwarning("Προσοχή", "Το Name και το Surname δεν μπορούν να είναι κενά.")
+        new_title = simpledialog.askstring("Edit Employee", "Job Title:", initialvalue=member["job_title"])
+        if new_title is None:
+            return
+        new_title = to_title_case(new_title)
+
+        if not new_first or not new_last or not new_title:
+            messagebox.showwarning("Προσοχή", "Το Name, το Surname και το Job Title δεν μπορούν να είναι κενά.")
             return
 
         if member_exists_db(new_first, new_last, exclude_id=member_id):
@@ -2082,32 +2136,17 @@ def open_member_profile_window(member_id, members_win, on_close_refresh):
             return
 
         update_member_name_db(member_id, new_first, new_last)
+        update_member_job_title_db(member_id, new_title)
+
         member["first_name"] = new_first
         member["last_name"] = new_last
+        member["job_title"] = new_title
+
         name_lbl.config(text=f"{new_first} {new_last}")
+        job_title_lbl.config(text=new_title)
         win.title(f"{new_first} {new_last}")
 
-    make_button(name_row, text="Edit", bg="#0F2A4A", fg="white", command=edit_name_action).pack(side="left", padx=(8, 0))
-
-    job_title_row = tk.Frame(header, bg="#EEF2F7")
-    job_title_row.pack(anchor="w")
-
-    job_title_lbl = tk.Label(job_title_row, text=member["job_title"], font=FONTS["f12b"], bg="#EEF2F7", fg="#5B7A99")
-    job_title_lbl.pack(side="left")
-
-    def edit_job_title_action():
-        new_title = simpledialog.askstring("Edit Job Title", "Job Title:", initialvalue=member["job_title"])
-        if new_title is None:
-            return
-        new_title = to_title_case(new_title)
-        if not new_title:
-            messagebox.showwarning("Προσοχή", "Το Job Title δεν μπορεί να είναι κενό.")
-            return
-        update_member_job_title_db(member_id, new_title)
-        member["job_title"] = new_title
-        job_title_lbl.config(text=new_title)
-
-    make_button(job_title_row, text="Edit", bg="#0F2A4A", fg="white", command=edit_job_title_action).pack(side="left", padx=(8, 0))
+    make_button(name_row, text="Edit", bg="#0F2A4A", fg="white", command=edit_profile_action).pack(side="left", padx=(8, 0))
 
     tk.Label(header, text=f"Registered: {member['created_date']}", font=FONTS["f9i"], bg="#EEF2F7", fg="#7A93AC").pack(anchor="w", pady=(2, 0))
 
@@ -2492,23 +2531,6 @@ def open_stocklist():
     import_supplier_var = tk.StringVar(value="")
     import_supplier_map = {}
 
-    def update_option_menu(menu_widget, variable, values, default_empty=True):
-        menu = menu_widget["menu"]
-        menu.delete(0, "end")
-
-        options = []
-        if default_empty:
-            options.append("")
-        options.extend(values)
-
-        for val in options:
-            menu.add_command(label=val, command=lambda v=val: variable.set(v))
-
-        if options:
-            variable.set(options[0])
-        else:
-            variable.set("")
-
     def detect_columns(columns):
         cols_lower = {c.lower(): c for c in columns}
 
@@ -2610,27 +2632,14 @@ def open_stocklist():
 
     tk.Label(row2, text="or new supplier:", bg="#EEF2F7").pack(side="left")
     new_supplier_entry = tk.Entry(row2, width=16)
-    new_supplier_entry.pack(side="left", padx=(4, 12))
+    new_supplier_entry.pack(side="left", padx=(4, 0))
 
-    tk.Label(row2, text="Sheet:", bg="#EEF2F7").pack(side="left")
-    sheet_menu = tk.OptionMenu(row2, sheet_var, "")
-    sheet_menu.config(width=18)
-    sheet_menu.pack(side="left", padx=(4, 12))
-
-    tk.Label(row2, text="Group column:", bg="#EEF2F7").pack(side="left")
-    group_menu = tk.OptionMenu(row2, group_var, "")
-    group_menu.config(width=22)
-    group_menu.pack(side="left", padx=(4, 12))
-
-    tk.Label(row2, text="Price column:", bg="#EEF2F7").pack(side="left")
-    price_menu = tk.OptionMenu(row2, price_var, "")
-    price_menu.config(width=22)
-    price_menu.pack(side="left", padx=(4, 12))
-
-    tk.Label(row2, text="Name column:", bg="#EEF2F7").pack(side="left")
-    name_menu = tk.OptionMenu(row2, name_var, "")
-    name_menu.config(width=22)
-    name_menu.pack(side="left", padx=(4, 0))
+    # No Sheet/Group/Price/Name pickers — those get auto-detected the
+    # moment a file is chosen (see detect_and_set_columns), so there's
+    # nothing to configure here. This just shows what got picked, for
+    # transparency, without being an interactive control.
+    detected_label = tk.Label(top_frame, text="", bg="#EEF2F7", fg="#5B7A99", font=FONTS["f9i"])
+    detected_label.pack(anchor="w", pady=(6, 0))
 
     info_label = tk.Label(top_frame, text="Total imported rows: 0", bg="#EEF2F7", fg="#0F2A4A", font=FONTS["f10b"])
     info_label.pack(anchor="w", pady=(8, 2))
@@ -2913,26 +2922,24 @@ def open_stocklist():
         else:
             render_item_view()
 
-    def on_sheet_change(*args):
-        current_sheet = sheet_var.get().strip()
-        if not current_sheet or current_sheet not in excel_data["sheets"]:
-            return
-
+    def detect_and_set_columns(current_sheet):
+        """Auto-picks Group/Price/Name columns for `current_sheet` — no
+        dropdowns for the user to fiddle with. Falls back to sensible
+        defaults (first/second column) if nothing recognizable is found,
+        and shows what it picked in `detected_label` so it's still visible,
+        just not something you have to configure."""
         df = excel_data["sheets"][current_sheet]
         cols = [str(c).strip() for c in df.columns.tolist()]
 
-        update_option_menu(group_menu, group_var, cols, default_empty=False)
-        update_option_menu(price_menu, price_var, cols, default_empty=False)
-        update_option_menu(name_menu, name_var, cols, default_empty=True)
-
         detected_group, detected_price, detected_name = detect_columns(cols)
+        group_var.set(detected_group)
+        price_var.set(detected_price)
+        name_var.set(detected_name)
 
-        if detected_group in cols:
-            group_var.set(detected_group)
-        if detected_price in cols:
-            price_var.set(detected_price)
-        if detected_name in cols or detected_name == "":
-            name_var.set(detected_name)
+        detected_text = f"Detected — Sheet: {current_sheet}  |  Group: {detected_group}  |  Price: {detected_price}"
+        if detected_name:
+            detected_text += f"  |  Name: {detected_name}"
+        detected_label.config(text=detected_text)
 
         info_label.config(text=f"Loaded sheet rows: {len(df)}")
 
@@ -2960,12 +2967,15 @@ def open_stocklist():
 
             excel_data["sheets"] = cleaned
             selected_file["path"] = path
-
-            sheet_names = list(cleaned.keys())
-            update_option_menu(sheet_menu, sheet_var, sheet_names, default_empty=False)
             file_label.config(text=path)
 
-            on_sheet_change()
+            # No sheet picker either — if there are multiple sheets, use
+            # whichever one actually has the most rows (almost always the
+            # real data sheet, as opposed to a small cover/notes sheet).
+            best_sheet = max(cleaned.keys(), key=lambda s: len(cleaned[s]))
+            sheet_var.set(best_sheet)
+
+            detect_and_set_columns(best_sheet)
 
         except Exception as e:
             messagebox.showerror("Error", f"Could not read Excel file:\n{e}")
@@ -3098,8 +3108,6 @@ def open_stocklist():
     make_button(btn_row, text="Choose Excel", bg="#0F2A4A", fg="white", width=14, command=choose_excel_file).pack(side="left", padx=(0, 8))
     make_button(btn_row, text="Import to Stocklist", bg="#639922", fg="white", width=16, command=import_selected_sheet).pack(side="left", padx=(0, 8))
     make_button(btn_row, text="Refresh", bg="#5B7A99", fg="white", width=12, command=render_stocklist_view).pack(side="left")
-
-    sheet_var.trace_add("write", on_sheet_change)
 
     refresh_import_supplier_menu()
     render_stocklist_view()
