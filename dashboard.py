@@ -6,7 +6,7 @@ import sqlite3
 import subprocess
 import tkinter as tk
 from tkinter import messagebox, simpledialog, filedialog, ttk
-from datetime import datetime
+from datetime import datetime, timedelta, date
 from email import policy
 from email.parser import BytesParser
 import pandas as pd
@@ -23,6 +23,18 @@ try:
     DND_AVAILABLE = True
 except ImportError:
     DND_AVAILABLE = False
+
+# The dashboard header logo needs resizing (the source file is a large
+# 1200px export), which Tk's own PhotoImage can only do via integer
+# subsample()/zoom() factors — Pillow gives a proper high-quality resize to
+# an exact pixel size. Optional, same graceful-degrade pattern as
+# tkinterdnd2 above: if it's not installed, the header just skips the logo
+# instead of crashing. Install with: pip install Pillow
+try:
+    from PIL import Image, ImageTk
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 CURRENCY_SYMBOLS = {"EUR": "€", "USD": "$", "JPY": "¥"}
 ATTACHMENT_TYPES = [
@@ -71,6 +83,42 @@ if not os.path.exists(DB_FILE) and os.path.exists(_LEGACY_DB_FILE):
     except OSError:
         pass
 
+# The logo is a bundled asset (ships alongside dashboard.py in the repo),
+# not per-user data — unlike DB_FILE above, it belongs next to the script,
+# not in the per-OS app-data folder. (If this ever gets packaged with
+# PyInstaller, logo.png needs to be added as a bundled data file and this
+# path updated to check sys._MEIPASS.)
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+
+# The logo's height at 1x — the same base the shared fonts scale from (see
+# bind_font_scaling/scale_fonts below). Without re-rendering the logo at a
+# proportionally bigger size as the window scales up, it stays pinned at
+# this tiny pixel size while the "Dashboard" text next to it grows, so on a
+# maximized/fullscreen window the two end up wildly mismatched in scale.
+LOGO_BASE_HEIGHT = 40
+
+
+def load_logo_image(max_height):
+    """Loads logo.png sized to `max_height` pixels tall (width scaled to
+    match its aspect ratio), or None if Pillow isn't installed, the file is
+    missing, or anything else goes wrong — callers should skip showing the
+    logo entirely when this returns None rather than erroring."""
+    if not PIL_AVAILABLE or not os.path.exists(LOGO_PATH):
+        return None
+    try:
+        img = Image.open(LOGO_PATH)
+        # Tk's image bridge doesn't reliably alpha-blend 2-channel "LA"
+        # (grayscale+alpha) or palette ("P") images — transparent areas can
+        # render as solid black instead of see-through. Converting to full
+        # 4-channel RGBA first makes the transparency render correctly.
+        img = img.convert("RGBA")
+        ratio = max_height / img.height
+        new_size = (max(1, int(img.width * ratio)), max_height)
+        img = img.resize(new_size, Image.LANCZOS)
+        return ImageTk.PhotoImage(img)
+    except Exception:
+        return None
+
 # ================= SUPPLIER FIELD VALIDATION =================
 # Name: letters (Greek or Latin) and numbers only (plus spaces).
 SUPPLIER_NAME_PATTERN = re.compile(r"^[A-Za-zΑ-Ωα-ωΆΈΉΊΌΎΏάέήίόύώϊϋΐΰ0-9\s]+$")
@@ -107,6 +155,40 @@ def to_title_case(text):
     upper-cases rather than title-cases — kept the name to avoid touching
     every call site.)"""
     return text.strip().upper()
+
+
+# Task deadlines and meeting dates are stored internally as YYYY-MM-DD
+# (sorts correctly as a plain string, which the DB queries rely on) but are
+# always typed/shown to the person as DD-MM-YYYY. These two helpers are the
+# only place that conversion happens, so every date entry/label/display
+# goes through them rather than juggling both formats ad hoc.
+def to_storage_date(display_str):
+    """"09-07-2026" -> "2026-07-09". Raises ValueError if it doesn't parse
+    as DD-MM-YYYY — callers should catch this and show a format warning."""
+    return datetime.strptime(display_str.strip(), "%d-%m-%Y").strftime("%Y-%m-%d")
+
+
+def to_display_date(storage_str):
+    """"2026-07-09" -> "09-07-2026". Falls back to returning the raw value
+    unchanged if it doesn't parse as YYYY-MM-DD, so unexpected/legacy data
+    never crashes the UI — it just shows as-is."""
+    if not storage_str:
+        return storage_str
+    try:
+        return datetime.strptime(storage_str, "%Y-%m-%d").strftime("%d-%m-%Y")
+    except (ValueError, TypeError):
+        return storage_str
+
+
+# A task's deadline counts as "approaching" (and triggers the dashboard
+# notice + the row's orange/red warning color) once it's within this many
+# days out, or already overdue.
+DEADLINE_WARNING_DAYS = 7
+
+# Shared labels/colors for the 1-3 task importance level, used by both the
+# Tasks list rows and the dashboard notification popup.
+IMPORTANCE_LABELS = {1: "1 - Low", 2: "2 - Medium", 3: "3 - High"}
+IMPORTANCE_COLORS = {1: "#5B7A99", 2: "#C97A1E", 3: "#A32D2D"}
 
 
 def get_conn():
@@ -236,6 +318,14 @@ def init_db():
     # Legacy single-assignee column, kept only so old data isn't lost —
     # tasks can now be assigned to multiple people via task_assignees below.
     _add_column_if_missing(cur, "tasks", "assigned_member_id", "INTEGER")
+    # Optional deadline, stored as YYYY-MM-DD (shown/typed as DD-MM-YYYY —
+    # see to_storage_date/to_display_date). Powers the "approaching deadline"
+    # notice on the main dashboard. NULL/empty means no deadline set.
+    _add_column_if_missing(cur, "tasks", "deadline", "TEXT")
+    # Optional importance level: 1 (Low) / 2 (Medium) / 3 (High). NULL means
+    # not set. Used together with deadline for the "Priority + Deadline"
+    # sort mode in the Tasks list.
+    _add_column_if_missing(cur, "tasks", "importance", "INTEGER")
 
     # One-time backfill: move any old single assigned_member_id values into
     # the new task_assignees table, so nothing gets silently dropped for
@@ -361,23 +451,61 @@ def set_email_expanded_db(email_id, expanded):
 
 
 # ================= TASKS =================
-def get_all_tasks():
+def get_all_tasks(order="newest"):
+    """order: 'newest' (default, most recently added first) or 'priority'
+    (importance high-to-low, then soonest deadline first within the same
+    importance level — see sort_tasks_by_priority)."""
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM tasks ORDER BY id DESC")
     rows = [dict(row) for row in cur.fetchall()]
     conn.close()
+
+    if order == "priority":
+        rows = sort_tasks_by_priority(rows)
+
     return rows
 
 
-def add_task_db(text, date, done=0):
+def sort_tasks_by_priority(tasks):
+    """Ranks tasks by importance first (3=High, 2=Medium, 1=Low, unset
+    sorts last), then by deadline soonest-first within the same importance
+    level (tasks with no deadline sort after ones that have it)."""
+    def sort_key(t):
+        importance = t.get("importance") or 0
+        deadline_str = t.get("deadline")
+        if deadline_str:
+            try:
+                deadline_val = datetime.strptime(deadline_str, "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                deadline_val = date.max
+        else:
+            deadline_val = date.max
+        return (-importance, deadline_val)
+
+    return sorted(tasks, key=sort_key)
+
+
+def add_task_db(text, date, done=0, deadline=None, importance=None):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("INSERT INTO tasks (text, date, done) VALUES (?, ?, ?)", (text, date, done))
+    cur.execute(
+        "INSERT INTO tasks (text, date, done, deadline, importance) VALUES (?, ?, ?, ?, ?)",
+        (text, date, done, deadline, importance)
+    )
     conn.commit()
     new_id = cur.lastrowid
     conn.close()
     return new_id
+
+
+def update_task_importance_db(task_id, importance):
+    """`importance` is an int 1-3, or None to clear it."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE tasks SET importance=? WHERE id=?", (importance, task_id))
+    conn.commit()
+    conn.close()
 
 
 def update_task_db(task_id, text):
@@ -386,6 +514,47 @@ def update_task_db(task_id, text):
     cur.execute("UPDATE tasks SET text=? WHERE id=?", (text, task_id))
     conn.commit()
     conn.close()
+
+
+def update_task_deadline_db(task_id, deadline):
+    """`deadline` is a YYYY-MM-DD string, or None/"" to clear it."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE tasks SET deadline=? WHERE id=?", (deadline or None, task_id))
+    conn.commit()
+    conn.close()
+
+
+def get_upcoming_deadline_tasks_db(days_ahead=DEADLINE_WARNING_DAYS):
+    """Active tasks with a deadline set, where that deadline is already
+    overdue or falls within `days_ahead` days from today — used to power
+    the "approaching deadline" notice on the main dashboard. Sorted
+    soonest/most-overdue first."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM tasks WHERE status='active' AND deadline IS NOT NULL AND deadline != ''")
+    rows = [dict(row) for row in cur.fetchall()]
+    conn.close()
+
+    today = datetime.now().date()
+    cutoff = today + timedelta(days=days_ahead)
+
+    results = []
+    for row in rows:
+        try:
+            d = datetime.strptime(row["deadline"], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        if d <= cutoff:
+            row["deadline_date"] = d
+            row["days_left"] = (d - today).days
+            results.append(row)
+
+    # Overdue/soonest-first is still the primary order (that's the whole
+    # point of a deadline notice), but within the same deadline urgency,
+    # higher importance floats to the top too.
+    results.sort(key=lambda r: (r["deadline_date"], -(r.get("importance") or 0)))
+    return results
 
 
 def set_task_done_db(task_id, done):
@@ -480,6 +649,26 @@ def get_tasks_for_member_db(member_id, statuses):
     rows = [dict(row) for row in cur.fetchall()]
     conn.close()
     return rows
+
+
+def get_active_task_counts_db():
+    """Returns {member_id: count_of_active_tasks}, only for members who have
+    at least one — used to show a current workload count next to each name
+    in the assignee picker (e.g. "John Smith — 3 tasks")."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT ta.member_id, COUNT(*) as cnt
+        FROM task_assignees ta
+        JOIN tasks t ON t.id = ta.task_id
+        WHERE t.status = 'active'
+        GROUP BY ta.member_id
+        """
+    )
+    counts = {row["member_id"]: row["cnt"] for row in cur.fetchall()}
+    conn.close()
+    return counts
 
 
 # ================= SUPPLIERS =================
@@ -947,6 +1136,60 @@ def get_all_stock_items_flat_db(search=""):
     return rows
 
 
+# ================= DASHBOARD SUMMARY =================
+def get_dashboard_summary_counts_db():
+    """Lightweight COUNT(*)-only stats (no full row fetches) for the live
+    status line shown under each section on the dashboard home screen —
+    this runs every time the dashboard is (re)shown, so it stays cheap."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM tasks WHERE status='active'")
+    active_tasks = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM suppliers")
+    supplier_count = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM members")
+    member_count = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM meetings")
+    meeting_count = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM stock_items")
+    stock_item_count = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(DISTINCT supplier_id) FROM stock_items WHERE supplier_id IS NOT NULL")
+    stock_supplier_count = cur.fetchone()[0]
+
+    conn.close()
+
+    return {
+        "active_tasks": active_tasks,
+        "supplier_count": supplier_count,
+        "member_count": member_count,
+        "meeting_count": meeting_count,
+        "stock_item_count": stock_item_count,
+        "stock_supplier_count": stock_supplier_count,
+    }
+
+
+def get_next_upcoming_meeting_db():
+    """Soonest meeting dated today or later, or None if there isn't one —
+    meeting_date is stored as YYYY-MM-DD text, so a plain string comparison
+    sorts correctly."""
+    conn = get_conn()
+    cur = conn.cursor()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    cur.execute(
+        "SELECT * FROM meetings WHERE meeting_date >= ? ORDER BY meeting_date ASC, id ASC LIMIT 1",
+        (today_str,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def open_file(path):
     try:
         if not path:
@@ -1057,6 +1300,9 @@ FONT_BASE_SPECS = {
     "f13b": (13, {"weight": "bold"}),
     "f10b": (10, {"weight": "bold"}),
     "f11o": (11, {"overstrike": True}),
+    "f18": (18, {}),
+    "f8b": (8, {"weight": "bold"}),
+    "f7b": (7, {"weight": "bold"}),
 }
 
 # Populated by setup_fonts(), which needs an actual Tk root to exist first —
@@ -1198,9 +1444,23 @@ def open_assignee_picker(parent, current_ids, on_confirm):
     dialog.title("Assign to")
     dialog.configure(bg="#EEF2F7")
     dialog.grab_set()
-    center_window(dialog, 320, 420)
+    center_window(dialog, 320, 460)
 
     tk.Label(dialog, text="Select people:", font=FONTS["f11b"], bg="#EEF2F7").pack(anchor="w", padx=12, pady=(12, 6))
+
+    filter_row = tk.Frame(dialog, bg="#EEF2F7")
+    filter_row.pack(fill="x", padx=12, pady=(0, 6))
+
+    tk.Label(filter_row, text="Search:", bg="#EEF2F7", font=FONTS["f9"]).pack(side="left")
+    search_entry = tk.Entry(filter_row, width=14)
+    search_entry.pack(side="left", padx=(4, 10))
+
+    tk.Label(filter_row, text="Job Title:", bg="#EEF2F7", font=FONTS["f9"]).pack(side="left")
+    job_title_filter_var = tk.StringVar(value="All")
+    job_titles = ["All"] + get_distinct_job_titles_db()
+    job_title_menu = tk.OptionMenu(filter_row, job_title_filter_var, *job_titles)
+    job_title_menu.config(width=10)
+    job_title_menu.pack(side="left", padx=(4, 0))
 
     list_outer = tk.Frame(dialog, bg="#ffffff")
     list_outer.pack(fill="both", expand=True, padx=12)
@@ -1220,18 +1480,43 @@ def open_assignee_picker(parent, current_ids, on_confirm):
 
     members = get_all_members()
     current_ids = set(current_ids)
-    vars_by_id = {}
+    task_counts = get_active_task_counts_db()
+    # One BooleanVar per member, seeded up front and kept alive for the life
+    # of the dialog — filtering (by search text / job title) only changes
+    # which Checkbuttons are rendered, never the vars themselves, so a
+    # person's checked state survives even while they're filtered out of view.
+    vars_by_id = {m["id"]: tk.BooleanVar(value=m["id"] in current_ids) for m in members}
 
-    if not members:
-        tk.Label(inner, text="Δεν υπάρχουν εργαζόμενοι ακόμα.", bg="#ffffff", fg="#5B7A99", font=FONTS["f9i"]).pack(anchor="w", padx=6, pady=6)
-    else:
-        for m in members:
-            var = tk.BooleanVar(value=m["id"] in current_ids)
-            vars_by_id[m["id"]] = var
-            tk.Checkbutton(
-                inner, text=f"{m['first_name']} {m['last_name']}", variable=var,
-                bg="#ffffff", anchor="w", font=FONTS["f10"]
-            ).pack(fill="x", padx=6, pady=2)
+    def render_list(*_):
+        for w in inner.winfo_children():
+            w.destroy()
+
+        search_text = search_entry.get().strip().lower()
+        selected_title = job_title_filter_var.get()
+
+        filtered = [
+            m for m in members
+            if (not search_text or search_text in f"{m['first_name']} {m['last_name']}".lower())
+            and (selected_title == "All" or m["job_title"] == selected_title)
+        ]
+
+        if not members:
+            tk.Label(inner, text="Δεν υπάρχουν εργαζόμενοι ακόμα.", bg="#ffffff", fg="#5B7A99", font=FONTS["f9i"]).pack(anchor="w", padx=6, pady=6)
+        elif not filtered:
+            tk.Label(inner, text="Δεν βρέθηκαν εργαζόμενοι.", bg="#ffffff", fg="#5B7A99", font=FONTS["f9i"]).pack(anchor="w", padx=6, pady=6)
+        else:
+            for m in filtered:
+                count = task_counts.get(m["id"], 0)
+                task_label = f"{count} task" if count == 1 else f"{count} tasks"
+                tk.Checkbutton(
+                    inner, text=f"{m['first_name']} {m['last_name']} ({m['job_title']}) — {task_label}", variable=vars_by_id[m["id"]],
+                    bg="#ffffff", anchor="w", font=FONTS["f10"]
+                ).pack(fill="x", padx=6, pady=2)
+
+    search_entry.bind("<KeyRelease>", render_list)
+    job_title_filter_var.trace_add("write", render_list)
+
+    render_list()
 
     def confirm():
         selected = [mid for mid, var in vars_by_id.items() if var.get()]
@@ -1426,6 +1711,14 @@ def go_back_to_dashboard(win):
     # appears already in its final size, no flash.
     apply_global_maximize_state_to(root)
     root.deiconify()
+    # Re-check for approaching/overdue task deadlines every time we land
+    # back on the dashboard, since a deadline could have been added, edited,
+    # or crossed the warning threshold while a section window was open.
+    refresh_deadline_bell()
+    # Same idea for the live status line under each section (task/member/
+    # supplier/etc. counts) — whatever changed in the section just closed
+    # should be reflected immediately.
+    refresh_dashboard_summary()
 
 
 def open_section_window(title, width, height):
@@ -1454,7 +1747,7 @@ def open_section_window(title, width, height):
 
     back_bar = tk.Frame(win, bg="#EEF2F7")
     back_bar.pack(fill="x", padx=10, pady=(10, 0))
-    make_button(back_bar, text="← Back to Dashboard", bg="#5B7A99", fg="white",
+    make_button(back_bar, text="←", bg="#5B7A99", fg="white", width=3, font=FONTS["f13b"],
                 command=lambda: go_back_to_dashboard(win)).pack(side="left")
 
     win.after_idle(win.deiconify)
@@ -1729,6 +2022,26 @@ def open_tasks():
     task_entry = tk.Entry(entry_frame, font=FONTS["f11"])
     task_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
 
+    deadline_row = tk.Frame(right_frame, bg="#ffffff")
+    deadline_row.pack(fill="x", padx=10, pady=(0, 5))
+
+    tk.Label(deadline_row, text="Deadline (DD-MM-YYYY, optional):", bg="#ffffff", font=FONTS["f9"]).pack(side="left", padx=(0, 4))
+    new_task_deadline_entry = tk.Entry(deadline_row, width=14, font=FONTS["f10"])
+    new_task_deadline_entry.pack(side="left")
+
+    tk.Label(deadline_row, text="Importance:", bg="#ffffff", font=FONTS["f9"]).pack(side="left", padx=(14, 4))
+    IMPORTANCE_NONE_LABEL = "None"
+    new_task_importance_var = tk.StringVar(value=IMPORTANCE_NONE_LABEL)
+    importance_menu = tk.OptionMenu(deadline_row, new_task_importance_var, IMPORTANCE_NONE_LABEL, "1 - Low", "2 - Medium", "3 - High")
+    importance_menu.config(width=10)
+    importance_menu.pack(side="left")
+
+    def parse_importance_choice(choice):
+        """"None" -> None, "1 - Low" -> 1, etc."""
+        if choice == IMPORTANCE_NONE_LABEL:
+            return None
+        return int(choice.split(" ", 1)[0])
+
     assign_row = tk.Frame(right_frame, bg="#ffffff")
     assign_row.pack(fill="x", padx=10, pady=(0, 5))
 
@@ -1755,6 +2068,23 @@ def open_tasks():
 
     make_button(assign_row, text="Assign", bg="#5B7A99", fg="white", command=pick_new_task_assignees).pack(side="left")
 
+    sort_row = tk.Frame(right_frame, bg="#ffffff")
+    sort_row.pack(fill="x", padx=10, pady=(4, 0))
+
+    tk.Label(sort_row, text="Sort:", bg="#ffffff", font=FONTS["f9"]).pack(side="left", padx=(0, 4))
+    sort_mode = tk.StringVar(value="newest")
+
+    def rerender_all_tasks():
+        for widget in tasks_container.winfo_children():
+            widget.destroy()
+        for t in get_all_tasks(order=sort_mode.get()):
+            render_task_row(t)
+
+    tk.Radiobutton(sort_row, text="Newest first", variable=sort_mode, value="newest",
+                   bg="#ffffff", font=FONTS["f9"], command=rerender_all_tasks).pack(side="left", padx=(0, 10))
+    tk.Radiobutton(sort_row, text="Priority + Deadline", variable=sort_mode, value="priority",
+                   bg="#ffffff", font=FONTS["f9"], command=rerender_all_tasks).pack(side="left")
+
     task_canvas = tk.Canvas(right_frame, bg="#ffffff", highlightthickness=0)
     task_scrollbar = tk.Scrollbar(right_frame, orient="vertical", command=task_canvas.yview)
     tasks_container = tk.Frame(task_canvas, bg="#ffffff")
@@ -1771,6 +2101,36 @@ def open_tasks():
     def render_task_row(task_dict):
         row_outer = tk.Frame(tasks_container, bg="#ffffff", relief="flat", borderwidth=0, highlightthickness=1, highlightbackground="#C8D4E2", pady=4, padx=4)
         row_outer.pack(fill="x", pady=4, padx=2)
+
+        # Tasks now carry a lot of info (deadline, priority, assignees,
+        # attachment) — like the email cards, each task collapses down to
+        # just its name by default, and expands on click to show the rest.
+        # This is purely in-memory UI state (not persisted), so every task
+        # opens collapsed again next time the Tasks window is opened.
+        task_dict.setdefault("_expanded", False)
+
+        def refresh_after_priority_change():
+            # Editing the deadline or priority can change where this task
+            # belongs in the list when sorted by "Priority + Deadline" — in
+            # that mode, re-render the whole list so it jumps to its new
+            # spot immediately; otherwise a plain in-place refresh is enough.
+            if sort_mode.get() == "priority":
+                rerender_all_tasks()
+            else:
+                refresh_row()
+
+        def has_deadline_warning():
+            # True once the deadline is within DEADLINE_WARNING_DAYS days out
+            # or already overdue — drives the yellow ⚠ shown on the
+            # collapsed row, same threshold as the dashboard bell.
+            deadline_str = task_dict.get("deadline")
+            if not deadline_str or task_dict["done"]:
+                return False
+            try:
+                deadline_date = datetime.strptime(deadline_str, "%Y-%m-%d").date()
+            except ValueError:
+                return False
+            return (deadline_date - datetime.now().date()).days <= DEADLINE_WARNING_DAYS
 
         def refresh_row():
             for widget in row_outer.winfo_children():
@@ -1797,7 +2157,27 @@ def open_tasks():
             task_font = FONTS["f11o"] if task_dict["done"] else FONTS["f11"]
             task_color = "#7A93AC" if task_dict["done"] else "#0F2A4A"
 
-            tk.Label(top_row, text=task_dict["text"], font=task_font, fg=task_color, bg="#ffffff", anchor="w", justify="left", wraplength=220).pack(side="left", fill="x", expand=True)
+            arrow = "▼" if task_dict["_expanded"] else "▶"
+            title_lbl = tk.Label(
+                top_row, text=f"{arrow} {task_dict['text']}", font=task_font, fg=task_color,
+                bg="#ffffff", anchor="w", justify="left", wraplength=170, cursor="hand2"
+            )
+            title_lbl.pack(side="left", fill="x", expand=True)
+
+            def toggle_expand(event=None):
+                task_dict["_expanded"] = not task_dict["_expanded"]
+                refresh_row()
+
+            title_lbl.bind("<Button-1>", toggle_expand)
+
+            # Yellow warning triangle: deadline is close (or overdue).
+            if has_deadline_warning():
+                tk.Label(top_row, text="⚠️", font=FONTS["f11"], bg="#ffffff").pack(side="left", padx=(2, 0))
+
+            # Constant red "!" — shown whenever importance is maxed out (3),
+            # independent of deadline timing.
+            if task_dict.get("importance") == 3 and not task_dict["done"]:
+                tk.Label(top_row, text="❗", font=FONTS["f11"], bg="#ffffff", fg="#A32D2D").pack(side="left", padx=(2, 0))
 
             def edit_task_action():
                 new_text = simpledialog.askstring("Edit Task", "Επεξεργασία task:", initialvalue=task_dict["text"])
@@ -1813,9 +2193,99 @@ def open_tasks():
             make_button(top_row, text="Edit", width=5, bg="#0F2A4A", fg="white", command=edit_task_action).pack(side="left", padx=2)
             make_icon_button(top_row, text="🗑️", command=delete_task_action).pack(side="left", padx=2)
 
+            if not task_dict["_expanded"]:
+                return
+
             bottom_row = tk.Frame(row_outer, bg="#ffffff")
             bottom_row.pack(fill="x", pady=(2, 0))
             tk.Label(bottom_row, text=f"📅 Καταχωρήθηκε: {task_dict['date']}", font=FONTS["f8i"], fg="#5B7A99", bg="#ffffff").pack(side="left")
+
+            deadline_row = tk.Frame(row_outer, bg="#ffffff")
+            deadline_row.pack(fill="x", pady=(2, 0))
+
+            deadline_str = task_dict.get("deadline")
+            deadline_text = "Deadline: — none —"
+            deadline_color = "#7A93AC"
+
+            if deadline_str and not task_dict["done"]:
+                try:
+                    deadline_date = datetime.strptime(deadline_str, "%Y-%m-%d").date()
+                    days_left = (deadline_date - datetime.now().date()).days
+                    deadline_display = to_display_date(deadline_str)
+                    if days_left < 0:
+                        deadline_text = f"⚠ Deadline {deadline_display} — OVERDUE by {abs(days_left)}d"
+                        deadline_color = "#A32D2D"
+                    elif days_left <= DEADLINE_WARNING_DAYS:
+                        deadline_text = f"⚠ Deadline {deadline_display} — {days_left}d left"
+                        deadline_color = "#C97A1E"
+                    else:
+                        deadline_text = f"Deadline: {deadline_display}"
+                        deadline_color = "#5B7A99"
+                except ValueError:
+                    deadline_text = f"Deadline: {deadline_str}"
+                    deadline_color = "#5B7A99"
+            elif deadline_str:
+                deadline_text = f"Deadline: {to_display_date(deadline_str)}"
+
+            tk.Label(deadline_row, text=deadline_text, font=FONTS["f8i"], fg=deadline_color, bg="#ffffff").pack(side="left")
+
+            def set_deadline_action(task_id=task_dict["id"]):
+                new_deadline_input = simpledialog.askstring(
+                    "Set Deadline",
+                    "Deadline (DD-MM-YYYY, άδειο για κανένα):",
+                    initialvalue=to_display_date(task_dict.get("deadline")) or ""
+                )
+                if new_deadline_input is None:
+                    return
+                new_deadline_input = new_deadline_input.strip()
+                new_deadline = None
+                if new_deadline_input:
+                    try:
+                        new_deadline = to_storage_date(new_deadline_input)
+                    except ValueError:
+                        messagebox.showwarning("Προσοχή", "Χρησιμοποίησε τη μορφή DD-MM-YYYY (π.χ. 15-07-2026).")
+                        return
+                update_task_deadline_db(task_id, new_deadline)
+                task_dict["deadline"] = new_deadline
+                refresh_after_priority_change()
+
+            make_button(deadline_row, text="Set Deadline", width=11, bg="#5B7A99", fg="white", command=set_deadline_action).pack(side="left", padx=(6, 0))
+
+            importance_row = tk.Frame(row_outer, bg="#ffffff")
+            importance_row.pack(fill="x", pady=(2, 0))
+
+            importance_val = task_dict.get("importance")
+            if importance_val in IMPORTANCE_LABELS:
+                importance_text = f"⭐ Priority: {IMPORTANCE_LABELS[importance_val]}"
+                importance_color = IMPORTANCE_COLORS[importance_val]
+            else:
+                importance_text = "Priority: — none —"
+                importance_color = "#7A93AC"
+
+            tk.Label(importance_row, text=importance_text, font=FONTS["f8i"], fg=importance_color, bg="#ffffff").pack(side="left")
+
+            def set_priority_action(task_id=task_dict["id"]):
+                current = task_dict.get("importance")
+                new_val = simpledialog.askstring(
+                    "Set Priority",
+                    "Importance (1=Low, 2=Medium, 3=High, άδειο για κανένα):",
+                    initialvalue=str(current) if current else ""
+                )
+                if new_val is None:
+                    return
+                new_val = new_val.strip()
+                if new_val == "":
+                    parsed = None
+                elif new_val in ("1", "2", "3"):
+                    parsed = int(new_val)
+                else:
+                    messagebox.showwarning("Προσοχή", "Δώσε 1, 2, 3, ή άφησέ το κενό.")
+                    return
+                update_task_importance_db(task_id, parsed)
+                task_dict["importance"] = parsed
+                refresh_after_priority_change()
+
+            make_button(importance_row, text="Set Priority", width=11, bg="#5B7A99", fg="white", command=set_priority_action).pack(side="left", padx=(6, 0))
 
             assignee_row = tk.Frame(row_outer, bg="#ffffff")
             assignee_row.pack(fill="x", pady=(2, 0))
@@ -1884,37 +2354,45 @@ def open_tasks():
 
         refresh_row()
 
-    def add_task_row(text):
+    def add_task_row(text, deadline=None, importance=None):
         date_str = datetime.now().strftime("%d/%m/%Y %H:%M")
-        task_id = add_task_db(text, date_str, 0)
+        task_id = add_task_db(text, date_str, 0, deadline=deadline, importance=importance)
 
         if new_task_assignee_ids:
             set_task_assignees_db(task_id, new_task_assignee_ids)
 
-        render_task_row({
-            "id": task_id,
-            "text": text,
-            "date": date_str,
-            "done": 0,
-            "status": "active",
-            "attachment_path": None
-        })
+        return task_id
 
     def add_task_action(event=None):
         text = task_entry.get().strip()
         if not text:
             messagebox.showwarning("Προσοχή", "Γράψε ένα task πρώτα.")
             return
-        add_task_row(text)
+
+        deadline_input = new_task_deadline_entry.get().strip()
+        deadline = None
+        if deadline_input:
+            try:
+                deadline = to_storage_date(deadline_input)
+            except ValueError:
+                messagebox.showwarning("Προσοχή", "Deadline: χρησιμοποίησε τη μορφή DD-MM-YYYY (π.χ. 15-07-2026).")
+                return
+
+        importance = parse_importance_choice(new_task_importance_var.get())
+
+        add_task_row(text, deadline, importance)
         task_entry.delete(0, tk.END)
+        new_task_deadline_entry.delete(0, tk.END)
+        new_task_importance_var.set(IMPORTANCE_NONE_LABEL)
         new_task_assignee_ids.clear()
         new_task_assignee_lbl.config(text=UNASSIGNED_LABEL)
+        rerender_all_tasks()
 
     make_button(entry_frame, text="Add Task", bg="#639922", fg="white", command=add_task_action).pack(side="left")
     task_entry.bind("<Return>", add_task_action)
+    new_task_deadline_entry.bind("<Return>", add_task_action)
 
-    for existing_task in get_all_tasks():
-        render_task_row(existing_task)
+    rerender_all_tasks()
 
 
 # ================= MEMBERS WINDOW =================
@@ -2336,10 +2814,10 @@ def open_meetings():
 
     tk.Label(left, text="Add Meeting", font=FONTS["f14b"], bg="#EEF2F7").pack(anchor="w", pady=(0, 10))
 
-    tk.Label(left, text="Date (YYYY-MM-DD):", bg="#EEF2F7", font=FONTS["f10"]).pack(anchor="w")
+    tk.Label(left, text="Date (DD-MM-YYYY):", bg="#EEF2F7", font=FONTS["f10"]).pack(anchor="w")
     date_entry = tk.Entry(left, width=24, font=FONTS["f11"])
     date_entry.pack(anchor="w", pady=(2, 10))
-    date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+    date_entry.insert(0, datetime.now().strftime("%d-%m-%Y"))
 
     tk.Label(left, text="Title:", bg="#EEF2F7", font=FONTS["f10"]).pack(anchor="w")
     title_entry = tk.Entry(left, width=24, font=FONTS["f11"])
@@ -2374,12 +2852,12 @@ def open_meetings():
         command=lambda: apply_filter()
     ).pack(side="left", padx=(0, 10))
 
-    tk.Label(filter_frame, text="Date:", bg="#ffffff", font=FONTS["f10"]).pack(side="left")
+    tk.Label(filter_frame, text="Date (DD-MM-YYYY):", bg="#ffffff", font=FONTS["f10"]).pack(side="left")
     filter_entry = tk.Entry(filter_frame, width=16, font=FONTS["f11"])
     filter_entry.pack(side="left", padx=(6, 8))
-    filter_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+    filter_entry.insert(0, datetime.now().strftime("%d-%m-%Y"))
 
-    tk.Button(filter_frame, text="Apply", bg="#0F2A4A", fg="white", width=10, command=lambda: apply_filter()).pack(side="left")
+    make_button(filter_frame, text="Apply", bg="#0F2A4A", fg="white", width=10, command=lambda: apply_filter()).pack(side="left")
 
     selected_date_label = tk.Label(right, text="", font=FONTS["f11b"], bg="#ffffff", fg="#0F2A4A")
     selected_date_label.pack(anchor="w", padx=10, pady=(0, 5))
@@ -2422,7 +2900,7 @@ def open_meetings():
 
             tk.Label(
                 box,
-                text=f"{meeting['meeting_date']} - {meeting['title']}",
+                text=f"{to_display_date(meeting['meeting_date'])} - {meeting['title']}",
                 font=FONTS["f11b"],
                 bg="#EEF2F7",
                 anchor="w"
@@ -2460,21 +2938,21 @@ def open_meetings():
             render_meetings(meetings, "Showing all meetings")
             return
 
-        selected_date = filter_entry.get().strip()
+        selected_date_input = filter_entry.get().strip()
 
         try:
-            datetime.strptime(selected_date, "%Y-%m-%d")
+            selected_date_storage = to_storage_date(selected_date_input)
         except ValueError:
-            selected_date_label.config(text="Λάθος μορφή ημερομηνίας. Βάλε YYYY-MM-DD")
+            selected_date_label.config(text="Λάθος μορφή ημερομηνίας. Βάλε DD-MM-YYYY")
             for widget in meetings_container.winfo_children():
                 widget.destroy()
             return
 
-        meetings = get_meetings_by_date(selected_date)
-        render_meetings(meetings, f"Showing meetings for: {selected_date}")
+        meetings = get_meetings_by_date(selected_date_storage)
+        render_meetings(meetings, f"Showing meetings for: {selected_date_input}")
 
     def add_meeting_action():
-        meeting_date = date_entry.get().strip()
+        meeting_date_input = date_entry.get().strip()
         title = title_entry.get().strip()
         note = note_text.get("1.0", "end").strip()
         created_at = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -2484,24 +2962,23 @@ def open_meetings():
             return
 
         try:
-            datetime.strptime(meeting_date, "%Y-%m-%d")
+            meeting_date_storage = to_storage_date(meeting_date_input)
         except ValueError:
-            messagebox.showwarning("Προσοχή", "Η ημερομηνία πρέπει να είναι στη μορφή YYYY-MM-DD.")
+            messagebox.showwarning("Προσοχή", "Η ημερομηνία πρέπει να είναι στη μορφή DD-MM-YYYY.")
             return
 
-        add_meeting_db(meeting_date, title, note, created_at)
+        add_meeting_db(meeting_date_storage, title, note, created_at)
 
         title_entry.delete(0, tk.END)
         note_text.delete("1.0", tk.END)
 
         filter_entry.delete(0, tk.END)
-        filter_entry.insert(0, meeting_date)
+        filter_entry.insert(0, meeting_date_input)
         view_mode.set("date")
 
         apply_filter()
 
-    tk.Button(left, text="Add Meeting", bg="#639922", fg="white", width=16, command=add_meeting_action).pack(anchor="w", pady=8)
-    tk.Button(top_filter, text="View", bg="#0F2A4A", fg="white", width=10, command=view_selected_date).pack(side="left")
+    make_button(left, text="Add Meeting", bg="#639922", fg="white", width=16, command=add_meeting_action).pack(anchor="w", pady=8)
 
     filter_entry.bind("<Return>", apply_filter)
 
@@ -3277,26 +3754,249 @@ root.configure(bg="#EEF2F7")
 setup_fonts()
 bind_font_scaling(root, 620, 480)
 
-header = tk.Label(root, text="Dashboard MSC", font=FONTS["f22b"], bg="#EEF2F7", fg="#0F2A4A")
-header.pack(pady=(30, 4))
+# Logo sits inline to the left of the title, both centered together as one
+# row — a small, compact icon+wordmark pairing rather than stacking a big
+# logo above the text. `root.logo_img` keeps a reference alive (Tkinter
+# garbage-collects PhotoImages with no living Python reference, which would
+# otherwise make the label go blank right after this runs). With the logo
+# right there doing the branding, the title itself just says "Dashboard" —
+# if the logo can't load (Pillow/file missing), it falls back to
+# "Dashboard MSC" instead so the brand name isn't lost entirely.
+title_row = tk.Frame(root, bg="#EEF2F7")
+title_row.pack(pady=(30, 10))
 
-subtitle = tk.Label(root, text="Tasks · Suppliers · Members · Meetings · Stocklist",
-                     font=FONTS["f10i"], bg="#EEF2F7", fg="#7A93AC")
-subtitle.pack(pady=(0, 4))
+logo_img_label = None
+_last_logo_scale = [1.0]
 
-divider = tk.Frame(root, bg="#C8D4E2", height=1)
-divider.pack(fill="x", padx=60, pady=(10, 25))
+root.logo_img = load_logo_image(max_height=LOGO_BASE_HEIGHT)
+if root.logo_img is not None:
+    logo_img_label = tk.Label(title_row, image=root.logo_img, bg="#EEF2F7")
+    logo_img_label.pack(side="left", padx=(0, 8))
+    title_text = "Dashboard"
+else:
+    title_text = "Dashboard MSC"
 
-btn_frame = tk.Frame(root, bg="#EEF2F7")
-btn_frame.pack(pady=5)
+header = tk.Label(title_row, text=title_text, font=FONTS["f22b"], bg="#EEF2F7", fg="#0F2A4A")
+header.pack(side="left")
 
-make_button(btn_frame, text="Tasks", width=18, height=2, bg="#0F2A4A", fg="white", command=open_tasks).grid(row=0, column=0, padx=14, pady=10)
-make_button(btn_frame, text="Suppliers", width=18, height=2, bg="#0F2A4A", fg="white", command=open_suppliers).grid(row=0, column=1, padx=14, pady=10)
-make_button(btn_frame, text="Members", width=18, height=2, bg="#639922", fg="white", command=open_members).grid(row=1, column=0, padx=14, pady=10)
-make_button(btn_frame, text="Meetings", width=18, height=2, bg="#0F2A4A", fg="white", command=open_meetings).grid(row=1, column=1, padx=14, pady=10)
-make_button(btn_frame, text="Stocklist", width=18, height=2, bg="#3D5A78", fg="white", command=open_stocklist).grid(row=2, column=0, columnspan=2, padx=14, pady=10)
 
-footer = tk.Label(root, text="Local SQLite storage enabled", font=FONTS["f10i"], bg="#EEF2F7", fg="#5B7A99")
-footer.pack(pady=(20, 0))
+def refresh_logo_size(event=None):
+    """Re-renders the logo at LOGO_BASE_HEIGHT × the current font scale, so
+    it grows/shrinks together with the rest of the UI instead of staying
+    pinned at its original pixel size while everything around it scales."""
+    if logo_img_label is None:
+        return
+    if abs(_current_font_scale - _last_logo_scale[0]) < 0.03:
+        return
+    _last_logo_scale[0] = _current_font_scale
+    new_img = load_logo_image(max_height=max(20, round(LOGO_BASE_HEIGHT * _current_font_scale)))
+    if new_img is not None:
+        root.logo_img = new_img
+        logo_img_label.config(image=new_img)
+
+
+# Runs after bind_font_scaling's own <Configure> handler (registered first,
+# above) — Tk fires same-event "+" bindings in registration order, so
+# _current_font_scale has already been updated by the time this reads it.
+root.bind("<Configure>", refresh_logo_size, add="+")
+
+subtitle = tk.Label(root, text="Tasks   ·   Suppliers   ·   Members   ·   Meetings   ·   Stocklist",
+                     font=FONTS["f10"], bg="#EEF2F7", fg="#5B7A99")
+subtitle.pack(pady=(0, 16))
+
+# Short centered accent bar instead of a full-width rule — a bit more
+# deliberate/designed than a plain horizontal line stretching edge to edge.
+divider = tk.Frame(root, bg="#0F2A4A", width=44, height=3)
+divider.pack(pady=(0, 24))
+
+# Notification bell, pinned to the top-right corner of the dashboard
+# regardless of the rest of the layout (place() rather than pack()). Kept
+# small and muted by default (barely-there grey) so it doesn't compete with
+# the main dashboard buttons — it only turns orange/red and grows a count
+# badge once there's actually something to flag (deadline overdue or within
+# DEADLINE_WARNING_DAYS). Clicking it opens a popup listing them
+# (soonest/most-overdue first, importance as tiebreaker).
+bell_frame = tk.Frame(root, bg="#EEF2F7")
+bell_frame.place(relx=1.0, rely=0.0, x=-14, y=10, anchor="ne")
+
+bell_label = tk.Label(bell_frame, text="🔔", font=FONTS["f13b"], bg="#EEF2F7", fg="#B7C3D1", cursor="hand2")
+bell_label.pack()
+
+# Parented to root (not bell_frame) — bell_frame is sized by pack() to just
+# fit the bell icon itself, so a badge placed with any outward offset would
+# get clipped to invisible at that tiny frame's edge. root is plenty big,
+# so the same place(in_=bell_label, ...) positioning has room to actually
+# show up just outside/above the bell.
+bell_badge = tk.Label(root, text="", font=FONTS["f11b"], bg="#EEF2F7", fg="#A32D2D", padx=0, pady=0, borderwidth=0, highlightthickness=0)
+
+
+def open_notifications_popup():
+    upcoming = get_upcoming_deadline_tasks_db()
+
+    popup = tk.Toplevel(root)
+    popup.title("Notifications")
+    popup.configure(bg="#ffffff")
+    popup.transient(root)
+
+    root.update_idletasks()
+    x = root.winfo_rootx() + root.winfo_width() - 340
+    y = root.winfo_rooty() + 60
+    popup.geometry(f"320x380+{max(x, 0)}+{max(y, 0)}")
+
+    tk.Label(popup, text="Deadline Notifications", font=FONTS["f12b"], bg="#ffffff", fg="#0F2A4A").pack(anchor="w", padx=12, pady=(12, 6))
+
+    list_outer = tk.Frame(popup, bg="#ffffff")
+    list_outer.pack(fill="both", expand=True, padx=10)
+
+    canvas = tk.Canvas(list_outer, bg="#ffffff", highlightthickness=0)
+    scrollbar = tk.Scrollbar(list_outer, orient="vertical", command=canvas.yview)
+    inner = tk.Frame(canvas, bg="#ffffff")
+
+    inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    bind_canvas_stretch(canvas, window_id)
+    bind_mousewheel_scroll(canvas)
+
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    if not upcoming:
+        tk.Label(inner, text="Καμία ειδοποίηση αυτή τη στιγμή.", bg="#ffffff", fg="#5B7A99", font=FONTS["f10i"]).pack(padx=8, pady=12)
+    else:
+        for t in upcoming:
+            row = tk.Frame(inner, bg="#ffffff", relief="flat", highlightthickness=1, highlightbackground="#C8D4E2", padx=8, pady=6)
+            row.pack(fill="x", padx=4, pady=3)
+
+            if t["days_left"] < 0:
+                status_text = f"⚠ OVERDUE by {abs(t['days_left'])}d"
+                status_color = "#A32D2D"
+            elif t["days_left"] == 0:
+                status_text = "⚠ Due today"
+                status_color = "#C97A1E"
+            else:
+                status_text = f"⚠ {t['days_left']}d left"
+                status_color = "#C97A1E"
+
+            importance_val = t.get("importance")
+            importance_suffix = f" · {IMPORTANCE_LABELS[importance_val]}" if importance_val in IMPORTANCE_LABELS else ""
+
+            tk.Label(row, text=t["text"], font=FONTS["f10b"], bg="#ffffff", fg="#0F2A4A", anchor="w", wraplength=260, justify="left").pack(fill="x")
+            tk.Label(row, text=f"{status_text} ({to_display_date(t['deadline'])}){importance_suffix}", font=FONTS["f8i"], bg="#ffffff", fg=status_color, anchor="w").pack(fill="x", pady=(2, 0))
+
+    make_button(popup, text="Open Tasks", bg="#5B7A99", fg="white", command=lambda: (popup.destroy(), open_tasks())).pack(pady=10)
+
+
+bell_label.bind("<Button-1>", lambda e: open_notifications_popup())
+bell_badge.bind("<Button-1>", lambda e: open_notifications_popup())
+
+
+def refresh_deadline_bell():
+    upcoming = get_upcoming_deadline_tasks_db()
+
+    if not upcoming:
+        bell_badge.place_forget()
+        bell_label.config(fg="#B7C3D1")  # muted/idle — nothing to flag
+        return
+
+    overdue_count = sum(1 for t in upcoming if t["days_left"] < 0)
+    urgent_color = "#A32D2D" if overdue_count else "#C97A1E"
+    bell_badge.config(text=str(len(upcoming)), fg=urgent_color)
+    bell_badge.place(in_=bell_label, relx=1.0, rely=0.0, x=2, y=-2, anchor="center")
+    bell_label.config(fg=urgent_color)
+
+
+refresh_deadline_bell()
+
+# Section nav rows — replaces the old plain button grid. Same click targets
+# and destinations, but each row also shows a live one-line status (task
+# count, headcount, item count, etc.) pulled from get_dashboard_summary_counts_db()
+# so the dashboard is informative at a glance, not just a launcher.
+nav_frame = tk.Frame(root, bg="#EEF2F7")
+nav_frame.pack(fill="x", padx=70, pady=(0, 12))
+
+nav_subtitle_labels = {}
+
+
+def make_nav_row(key, title, icon, command, accent):
+    row = tk.Frame(nav_frame, bg="#ffffff", relief="flat", highlightthickness=1, highlightbackground="#C8D4E2", cursor="hand2")
+    row.pack(fill="x", pady=4)
+
+    icon_lbl = tk.Label(row, text=icon, font=FONTS["f14b"], bg="#ffffff", fg=accent, cursor="hand2", width=3)
+    icon_lbl.pack(side="left", padx=(10, 0), pady=8)
+
+    text_frame = tk.Frame(row, bg="#ffffff", cursor="hand2")
+    text_frame.pack(side="left", fill="both", expand=True, padx=(6, 8), pady=8)
+
+    title_lbl = tk.Label(text_frame, text=title, font=FONTS["f12b"], bg="#ffffff", fg="#0F2A4A", anchor="w", cursor="hand2")
+    title_lbl.pack(fill="x")
+
+    subtitle_lbl = tk.Label(text_frame, text="", font=FONTS["f9"], bg="#ffffff", fg="#5B7A99", anchor="w", cursor="hand2")
+    subtitle_lbl.pack(fill="x")
+
+    arrow_lbl = tk.Label(row, text="›", font=FONTS["f13b"], bg="#ffffff", fg="#B7C3D1", cursor="hand2")
+    arrow_lbl.pack(side="right", padx=12)
+
+    def on_click(event=None):
+        command()
+
+    def on_enter(event=None):
+        row.config(bg="#F3F6FA")
+        for w in (icon_lbl, text_frame, title_lbl, subtitle_lbl, arrow_lbl):
+            w.config(bg="#F3F6FA")
+
+    def on_leave(event=None):
+        row.config(bg="#ffffff")
+        for w in (icon_lbl, text_frame, title_lbl, subtitle_lbl, arrow_lbl):
+            w.config(bg="#ffffff")
+
+    for widget in (row, icon_lbl, text_frame, title_lbl, subtitle_lbl, arrow_lbl):
+        widget.bind("<Button-1>", on_click)
+        widget.bind("<Enter>", on_enter)
+        widget.bind("<Leave>", on_leave)
+
+    nav_subtitle_labels[key] = subtitle_lbl
+
+
+make_nav_row("tasks", "Tasks", "📋", open_tasks, "#0F2A4A")
+make_nav_row("suppliers", "Suppliers", "🚚", open_suppliers, "#0F2A4A")
+make_nav_row("members", "Members", "👥", open_members, "#639922")
+make_nav_row("meetings", "Meetings", "📅", open_meetings, "#0F2A4A")
+make_nav_row("stocklist", "Stocklist", "📦", open_stocklist, "#3D5A78")
+
+
+def refresh_dashboard_summary():
+    counts = get_dashboard_summary_counts_db()
+    upcoming = get_upcoming_deadline_tasks_db()
+
+    tasks_text = f"{counts['active_tasks']} active"
+    if upcoming:
+        tasks_text += f" · {len(upcoming)} near deadline"
+    nav_subtitle_labels["tasks"].config(text=tasks_text)
+
+    nav_subtitle_labels["suppliers"].config(text=f"{counts['supplier_count']} registered")
+    nav_subtitle_labels["members"].config(text=f"{counts['member_count']} people")
+
+    next_meeting = get_next_upcoming_meeting_db()
+    if next_meeting:
+        nav_subtitle_labels["meetings"].config(text=f"next: {to_display_date(next_meeting['meeting_date'])}")
+    else:
+        nav_subtitle_labels["meetings"].config(text=f"{counts['meeting_count']} logged")
+
+    nav_subtitle_labels["stocklist"].config(text=f"{counts['stock_item_count']} items · {counts['stock_supplier_count']} suppliers")
+
+
+refresh_dashboard_summary()
+
+# Thin rule + small status dot instead of plain italic text — reads more
+# like a system status line than an afterthought caption.
+footer_divider = tk.Frame(root, bg="#C8D4E2", height=1)
+footer_divider.pack(fill="x", padx=200, pady=(16, 8))
+
+footer_row = tk.Frame(root, bg="#EEF2F7")
+footer_row.pack(pady=(0, 16))
+
+tk.Label(footer_row, text="●", font=FONTS["f8b"], bg="#EEF2F7", fg="#639922").pack(side="left", padx=(0, 6))
+tk.Label(footer_row, text="Local SQLite storage enabled", font=FONTS["f9"], bg="#EEF2F7", fg="#7A93AC").pack(side="left")
 
 root.mainloop()
