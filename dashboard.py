@@ -2603,19 +2603,38 @@ def open_stocklist():
 
         return detected_group, detected_price, detected_name
 
+    # Columns whose value should be auto-suggested for exclusion from
+    # Price — delivery/packaging/handling are routinely bundled into a
+    # "total" price in supplier spreadsheets, but they're not part of the
+    # item's own cost. This is a starting suggestion the user can still
+    # adjust via "Choose columns…"; it doesn't lock anything in.
+    EXCLUDE_KEYWORDS = [
+        "delivery", "shipping", "transport", "transportation", "freight",
+        "packaging", "packing", "handling",
+    ]
+
+    def detect_exclude_columns(columns):
+        detected = []
+        for col in columns:
+            col_lower = col.lower()
+            if any(keyword in col_lower for keyword in EXCLUDE_KEYWORDS):
+                detected.append(col)
+        return detected
+
     row2 = tk.Frame(top_frame, bg="#EEF2F7")
     row2.pack(fill="x", pady=4)
 
     # Supplier is required for every import — each Excel is assumed to be
     # one supplier's price list, tagging every row lets the stocklist be
-    # browsed by supplier later. Deliberately a dropdown of ALREADY
-    # REGISTERED suppliers (not free-typed text), so "Acme Corp" and
-    # "acme corp." can't end up as two different suppliers by accident —
-    # if a supplier isn't registered yet, add them in Suppliers first.
+    # browsed by supplier later. Preferably pick an ALREADY REGISTERED
+    # supplier from the dropdown (avoids "Acme Corp" vs "acme corp." ending
+    # up as two different suppliers by accident), but if theirs isn't
+    # registered yet, typing a name in the field next to it registers them
+    # automatically on import instead of forcing a trip to Suppliers first.
     tk.Label(row2, text="Supplier:", bg="#EEF2F7").pack(side="left")
     import_supplier_menu = tk.OptionMenu(row2, import_supplier_var, "")
     import_supplier_menu.config(width=18)
-    import_supplier_menu.pack(side="left", padx=(4, 12))
+    import_supplier_menu.pack(side="left", padx=(4, 8))
 
     def refresh_import_supplier_menu():
         menu = import_supplier_menu["menu"]
@@ -2629,6 +2648,10 @@ def open_stocklist():
 
         if import_supplier_var.get() not in import_supplier_map:
             import_supplier_var.set(suppliers[0]["name"] if suppliers else "")
+
+    tk.Label(row2, text="or new supplier:", bg="#EEF2F7").pack(side="left")
+    new_supplier_entry = tk.Entry(row2, width=16)
+    new_supplier_entry.pack(side="left", padx=(4, 12))
 
     tk.Label(row2, text="Sheet:", bg="#EEF2F7").pack(side="left")
     sheet_menu = tk.OptionMenu(row2, sheet_var, "")
@@ -2985,8 +3008,12 @@ def open_stocklist():
             name_var.set(detected_name)
 
         # Column names can differ sheet to sheet, so a previously chosen
-        # exclude-list might not even exist here — start fresh each time.
-        exclude_state["selected"] = []
+        # exclude-list might not even exist here — start fresh each time,
+        # but auto-suggest any delivery/packaging/handling-looking columns
+        # right away rather than making the user find them manually via
+        # "Choose columns…" every single import.
+        used = {group_var.get().strip(), price_var.get().strip(), name_var.get().strip()}
+        exclude_state["selected"] = [c for c in detect_exclude_columns(cols) if c not in used]
         refresh_exclude_summary()
 
         info_label.config(text=f"Loaded sheet rows: {len(df)}")
@@ -3030,14 +3057,37 @@ def open_stocklist():
             messagebox.showwarning("Warning", "Διάλεξε πρώτα Excel αρχείο.")
             return
 
-        supplier_name = import_supplier_var.get().strip()
-        supplier_id = import_supplier_map.get(supplier_name)
-        if not supplier_id:
-            messagebox.showwarning(
-                "Warning",
-                "Επίλεξε Supplier πρώτα. Αν ο supplier δεν υπάρχει ακόμα, πρόσθεσέ τον στην ενότητα Suppliers."
+        # A typed name in "or new supplier" wins over the dropdown — lets
+        # someone register a not-yet-known supplier right here instead of
+        # having to go set them up in Suppliers first.
+        typed_supplier_name = new_supplier_entry.get().strip()
+        if typed_supplier_name:
+            error = validate_supplier_fields(typed_supplier_name, "", "")
+            if error:
+                messagebox.showwarning("Προσοχή", error)
+                return
+
+            existing = next(
+                (s for s in get_all_suppliers() if s["name"].strip().lower() == typed_supplier_name.lower()),
+                None
             )
-            return
+            if existing:
+                supplier_id = existing["id"]
+                supplier_name = existing["name"]
+            else:
+                supplier_id = add_supplier_db(typed_supplier_name, "", "")
+                supplier_name = typed_supplier_name
+                refresh_import_supplier_menu()
+                import_supplier_var.set(supplier_name)
+        else:
+            supplier_name = import_supplier_var.get().strip()
+            supplier_id = import_supplier_map.get(supplier_name)
+            if not supplier_id:
+                messagebox.showwarning(
+                    "Warning",
+                    "Επίλεξε Supplier από τη λίστα, ή γράψε το όνομα ενός νέου supplier."
+                )
+                return
 
         current_sheet = sheet_var.get().strip()
         group_col = group_var.get().strip()
@@ -3136,6 +3186,7 @@ def open_stocklist():
         clear_stock_items_for_supplier_db(supplier_id)
         add_stock_rows_db(rows)
         render_stocklist_view()
+        new_supplier_entry.delete(0, tk.END)
 
         success_msg = f"Έγινε import {len(rows)} γραμμών από το sheet '{current_sheet}' για τον supplier '{supplier_name}'."
         if excluded_cols_present:
