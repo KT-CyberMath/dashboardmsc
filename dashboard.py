@@ -95,7 +95,13 @@ LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
 # proportionally bigger size as the window scales up, it stays pinned at
 # this tiny pixel size while the "Dashboard" text next to it grows, so on a
 # maximized/fullscreen window the two end up wildly mismatched in scale.
-LOGO_BASE_HEIGHT = 40
+LOGO_BASE_HEIGHT = 70
+
+# Same idea for the little accent bar under the tagline — sized to actually
+# look proportioned next to the much bigger 40pt title, and rescaled
+# together with everything else on window resize (see refresh_header_scale).
+DIVIDER_BASE_WIDTH = 90
+DIVIDER_BASE_HEIGHT = 4
 
 
 def load_logo_image(max_height):
@@ -1303,6 +1309,14 @@ FONT_BASE_SPECS = {
     "f18": (18, {}),
     "f8b": (8, {"weight": "bold"}),
     "f7b": (7, {"weight": "bold"}),
+    "f12": (12, {}),
+    "f24": (24, {}),
+    # "Arial Black" is a genuinely heavier weight than bold Arial can
+    # achieve (Tk font weight is just normal/bold, no extra-bold/black) —
+    # used only for the dashboard title. Falls back to the system's default
+    # substitute font if Arial Black isn't installed, so this degrades
+    # safely rather than erroring on machines that don't have it.
+    "f32b": (40, {"weight": "bold", "family": "Arial Black"}),
 }
 
 # Populated by setup_fonts(), which needs an actual Tk root to exist first —
@@ -1318,7 +1332,13 @@ def setup_fonts():
     the Tk root window is created (root = tk.Tk() / TkinterDnD.Tk())."""
     import tkinter.font as tkfont
     for key, (size, extra) in FONT_BASE_SPECS.items():
-        FONTS[key] = tkfont.Font(family="Arial", size=size, **extra)
+        extra = dict(extra)
+        # Everything defaults to Arial, but a spec can override with its own
+        # "family" (e.g. "Arial Black" for a genuinely heavier weight than
+        # bold Arial can give) — pulled out here since Font() takes family
+        # as its own argument, not as part of the style kwargs.
+        family = extra.pop("family", "Arial")
+        FONTS[key] = tkfont.Font(family=family, size=size, **extra)
 
 
 def scale_fonts(scale):
@@ -3772,54 +3792,69 @@ root.logo_img = load_logo_image(max_height=LOGO_BASE_HEIGHT)
 if root.logo_img is not None:
     logo_img_label = tk.Label(title_row, image=root.logo_img, bg="#EEF2F7")
     logo_img_label.pack(side="left", padx=(0, 8))
-    title_text = "Dashboard"
+    title_text = "DASHBOARD"
 else:
-    title_text = "Dashboard MSC"
+    title_text = "DASHBOARD MSC"
 
-header = tk.Label(title_row, text=title_text, font=FONTS["f22b"], bg="#EEF2F7", fg="#0F2A4A")
+header = tk.Label(title_row, text=title_text, font=FONTS["f32b"], bg="#EEF2F7", fg="#000000")
 header.pack(side="left")
 
 
-def refresh_logo_size(event=None):
-    """Re-renders the logo at LOGO_BASE_HEIGHT × the current font scale, so
-    it grows/shrinks together with the rest of the UI instead of staying
-    pinned at its original pixel size while everything around it scales."""
-    if logo_img_label is None:
-        return
+def refresh_header_scale(event=None):
+    """Re-renders the logo and resizes the accent bar together, both scaled
+    to the current font scale, so the whole header — title text (handled
+    automatically by the shared FONTS scaling), logo, and accent bar — grows
+    and shrinks as one proportioned unit instead of the image/frame-based
+    pieces staying pinned at their original pixel sizes while the text
+    around them scales."""
     if abs(_current_font_scale - _last_logo_scale[0]) < 0.03:
         return
     _last_logo_scale[0] = _current_font_scale
-    new_img = load_logo_image(max_height=max(20, round(LOGO_BASE_HEIGHT * _current_font_scale)))
-    if new_img is not None:
-        root.logo_img = new_img
-        logo_img_label.config(image=new_img)
+
+    if logo_img_label is not None:
+        new_img = load_logo_image(max_height=max(20, round(LOGO_BASE_HEIGHT * _current_font_scale)))
+        if new_img is not None:
+            root.logo_img = new_img
+            logo_img_label.config(image=new_img)
+
+    divider.config(
+        width=max(20, round(DIVIDER_BASE_WIDTH * _current_font_scale)),
+        height=max(2, round(DIVIDER_BASE_HEIGHT * _current_font_scale))
+    )
 
 
 # Runs after bind_font_scaling's own <Configure> handler (registered first,
 # above) — Tk fires same-event "+" bindings in registration order, so
 # _current_font_scale has already been updated by the time this reads it.
-root.bind("<Configure>", refresh_logo_size, add="+")
+root.bind("<Configure>", refresh_header_scale, add="+")
 
-subtitle = tk.Label(root, text="Tasks   ·   Suppliers   ·   Members   ·   Meetings   ·   Stocklist",
-                     font=FONTS["f10"], bg="#EEF2F7", fg="#5B7A99")
-subtitle.pack(pady=(0, 16))
+# The section list (Tasks/Suppliers/Members/...) is dropped here — it's
+# redundant with the nav rows just below, which already show those names.
+# Small uppercase tagline under the title instead — Tkinter has no
+# letter-spacing property, so the spacing is faked by literally inserting
+# spaces between the characters.
+tagline = tk.Label(root, text="D A I L Y   O P E R A T I O N S", font=FONTS["f12"], bg="#EEF2F7", fg="#7A93AC")
+tagline.pack(pady=(0, 18))
 
 # Short centered accent bar instead of a full-width rule — a bit more
 # deliberate/designed than a plain horizontal line stretching edge to edge.
-divider = tk.Frame(root, bg="#0F2A4A", width=44, height=3)
-divider.pack(pady=(0, 24))
+# Base size here should match DIVIDER_BASE_WIDTH/HEIGHT above (this is what
+# 1x/unscaled looks like; refresh_header_scale takes it from here).
+divider = tk.Frame(root, bg="#000000", width=DIVIDER_BASE_WIDTH, height=DIVIDER_BASE_HEIGHT)
+divider.pack(pady=(0, 26))
 
 # Notification bell, pinned to the top-right corner of the dashboard
-# regardless of the rest of the layout (place() rather than pack()). Kept
-# small and muted by default (barely-there grey) so it doesn't compete with
-# the main dashboard buttons — it only turns orange/red and grows a count
-# badge once there's actually something to flag (deadline overdue or within
-# DEADLINE_WARNING_DAYS). Clicking it opens a popup listing them
-# (soonest/most-overdue first, importance as tiebreaker).
+# regardless of the rest of the layout (place() rather than pack()). Muted
+# grey by default (nothing to flag) — turns orange/red and grows a count
+# badge once there's something to flag (deadline overdue or within
+# DEADLINE_WARNING_DAYS). Sized to match the now much bigger/bolder header
+# (f24/f14b, up from f13b/f11b) — and since these are regular shared FONTS
+# entries, they scale with the window automatically the same way the title
+# does, no extra scaling code needed here.
 bell_frame = tk.Frame(root, bg="#EEF2F7")
-bell_frame.place(relx=1.0, rely=0.0, x=-14, y=10, anchor="ne")
+bell_frame.place(relx=1.0, rely=0.0, x=-22, y=16, anchor="ne")
 
-bell_label = tk.Label(bell_frame, text="🔔", font=FONTS["f13b"], bg="#EEF2F7", fg="#B7C3D1", cursor="hand2")
+bell_label = tk.Label(bell_frame, text="🔔", font=FONTS["f24"], bg="#EEF2F7", fg="#B7C3D1", cursor="hand2")
 bell_label.pack()
 
 # Parented to root (not bell_frame) — bell_frame is sized by pack() to just
@@ -3827,7 +3862,7 @@ bell_label.pack()
 # get clipped to invisible at that tiny frame's edge. root is plenty big,
 # so the same place(in_=bell_label, ...) positioning has room to actually
 # show up just outside/above the bell.
-bell_badge = tk.Label(root, text="", font=FONTS["f11b"], bg="#EEF2F7", fg="#A32D2D", padx=0, pady=0, borderwidth=0, highlightthickness=0)
+bell_badge = tk.Label(root, text="", font=FONTS["f14b"], bg="#EEF2F7", fg="#A32D2D", padx=0, pady=0, borderwidth=0, highlightthickness=0)
 
 
 def open_notifications_popup():
@@ -3902,7 +3937,7 @@ def refresh_deadline_bell():
     overdue_count = sum(1 for t in upcoming if t["days_left"] < 0)
     urgent_color = "#A32D2D" if overdue_count else "#C97A1E"
     bell_badge.config(text=str(len(upcoming)), fg=urgent_color)
-    bell_badge.place(in_=bell_label, relx=1.0, rely=0.0, x=2, y=-2, anchor="center")
+    bell_badge.place(in_=bell_label, relx=1.0, rely=0.0, x=6, y=-6, anchor="center")
     bell_label.config(fg=urgent_color)
 
 
