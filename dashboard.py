@@ -125,6 +125,7 @@ def load_logo_image(max_height):
     except Exception:
         return None
 
+
 # ================= SUPPLIER FIELD VALIDATION =================
 # Name: letters (Greek or Latin) and numbers only (plus spaces).
 SUPPLIER_NAME_PATTERN = re.compile(r"^[A-Za-zΑ-Ωα-ωΆΈΉΊΌΎΏάέήίόύώϊϋΐΰ0-9\s]+$")
@@ -3765,14 +3766,17 @@ init_db()
 
 root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
 root.title("Dashboard MSC")
-center_window(root, 620, 480)
+# Taller than the original 620x480 (the header grew a lot since then — bigger
+# logo, 40pt title, tagline, accent bar), but 760 turned out to overshoot
+# and leave a big empty gap below the footer — 640 is the closer fit.
+center_window(root, 620, 640)
 root.configure(bg="#EEF2F7")
 
 # Fonts are shared, scalable Font objects rather than plain ("Arial", N)
 # tuples — this must run once an actual Tk root exists, and before any
 # window creates widgets that reference FONTS[...].
 setup_fonts()
-bind_font_scaling(root, 620, 480)
+bind_font_scaling(root, 620, 640)
 
 # Logo sits inline to the left of the title, both centered together as one
 # row — a small, compact icon+wordmark pairing rather than stacking a big
@@ -3847,10 +3851,9 @@ divider.pack(pady=(0, 26))
 # regardless of the rest of the layout (place() rather than pack()). Muted
 # grey by default (nothing to flag) — turns orange/red and grows a count
 # badge once there's something to flag (deadline overdue or within
-# DEADLINE_WARNING_DAYS). Sized to match the now much bigger/bolder header
-# (f24/f14b, up from f13b/f11b) — and since these are regular shared FONTS
-# entries, they scale with the window automatically the same way the title
-# does, no extra scaling code needed here.
+# DEADLINE_WARNING_DAYS). f24/f14b are regular shared FONTS entries, so
+# they scale with the window automatically the same way the title does, no
+# extra scaling code needed here.
 bell_frame = tk.Frame(root, bg="#EEF2F7")
 bell_frame.place(relx=1.0, rely=0.0, x=-22, y=16, anchor="ne")
 
