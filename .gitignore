@@ -1,0 +1,16 @@
+# Local virtual environment
+.venv/
+
+# Desktop app wrapper — hardcodes an absolute path to this machine's
+# checkout + venv, so it's personal to whoever built it, not something to
+# share via git. Each person who wants one should build their own (see
+# README).
+Dashboard MSC.app/
+launch_error.log
+
+# Local runtime data / OS cruft
+dashboard.db
+.DS_Store
+__pycache__/
+*.pyc
+*.bak
